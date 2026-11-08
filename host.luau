@@ -25,6 +25,13 @@
 -- keeps the selection (shift-arrows, drag, double/triple click, cmd+a) and sends edits as
 -- `edit` events and cmd+z as `undo`. The block's `Field` model applies those, plus the
 -- keys Tern leaves to the program (typing, deletes, word moves, ctrl+a, redo).
+--
+-- Tickets tab (Jira): the window half holds the connection (jira.luau; the token is in the
+-- keychain) and this block asks it over "todo-jira:" links (jira-link.luau). The tab lists the
+-- active sprint of the chosen board. Keys: j/k move, Enter starts the ticket (adds it as a task
+-- linked by `jira.key` and launches it like Enter on a task), a adds it without starting, o
+-- opens it in Jira, r reloads, p picks the project, b the board, c edits the connection. A
+-- linked task that turns done moves its issue to a done status in Jira (see `rewrite`).
 
 local ui = tern.ui
 local session = require("./session")
@@ -32,6 +39,10 @@ local json = require("./json")
 require("./session-import")
 local auto_import = require("./auto-import")
 local session_files = require("./session-files")
+-- The Tickets tab's functions and constants live in this one table: the chunk is close to
+-- Luau's limit of 200 locals.
+local jira = {}
+jira.link = require("./jira-link")
 
 local POLL_MS = 5 * 1000
 -- fswatch reports a file change within about WATCH_LATENCY_S; POLL_MS stays as the fallback when it is missing or misses an event.
@@ -101,6 +112,8 @@ local SEARCH: { [string]: string } = {
 	project = "Search projects",
 	model = "Search models",
 	chat = "Search chats",
+	jira_project = "Search projects",
+	jira_board = "Search boards",
 }
 
 -- Settings (tern.kv "settings", shared by every Todos block and window; absent keys use
@@ -121,10 +134,19 @@ local SETTINGS: { { id: string, label: string, hint: string, default: boolean } 
 	{ id = "done_group", label = "Done tasks as a separate group", hint = "Collapse completed tasks into their own Done section.", default = false },
 	{ id = "omp_titles", label = "Task titles from omp", hint = "Default for linked tasks, which take the title omp gives their session. Each task has its own switch; renaming a task turns it off.", default = false },
 }
+-- Jira: a sprint is refetched when the Tickets tab opens after STALE_S; a request the window
+-- leaves unanswered for WAIT_MS is given up. TONE colours a ticket's status badge by its Jira
+-- status category.
+jira.STALE_S = 60
+jira.WAIT_MS = 120 * 1000
+jira.TONE = { new = "muted", indeterminate = "accent", done = "success" } :: { [string]: string }
+jira.TOKEN_PAGE = "https://id.atlassian.com/manage-profile/security/api-tokens"
 
 
 type Links = { tern_pane: number?, cwd: string?, omp_session: string? }
 type Agent = { model: string?, thinking: string? }
+-- The Jira issue a task was made from (Tickets tab); `url` is its browse link.
+type JiraLink = { key: string, url: string? }
 type Todo = {
 	id: string,
 	title: string,
@@ -142,10 +164,57 @@ type Todo = {
 	created: string?,
 	updated: string?,
 	completed: string?,
+	jira: JiraLink?,
 }
 
 type Model = { selector: string, id: string, provider: string, reasoning: boolean, efforts: { string }, context: string }
 type Chat = { id: string, title: string, cwd: string, mtime: number }
+
+-- An issue of the active sprint, as jira.luau sends it; `category` is Jira's status category
+-- key (new, indeterminate, done).
+type Ticket = {
+	key: string,
+	summary: string,
+	status: string,
+	category: string,
+	kind: string?,
+	assignee: string?,
+	priority: string?,
+	description: string?,
+	sprint: string?,
+}
+type JiraProject = { key: string, name: string }
+type JiraBoard = { id: number, name: string, kind: string? }
+type Sprint = { id: number, name: string, ends: string? }
+-- What the Tickets tab knows. `conn` is "unknown" until the window first answers, then
+-- "connected" or "disconnected". `busy` and `last` are keyed by request slot: the op, or
+-- "done:<key>" per issue; `last` holds the newest request number, so older answers and the
+-- copies a second window sends are dropped.
+type Jira = {
+	conn: string,
+	url: string?,
+	email: string?,
+	user: string?,
+	project: JiraProject?,
+	board: JiraBoard?,
+	projects: { JiraProject }?,
+	boards: { JiraBoard }?,
+	boards_for: string?,
+	sprints: { Sprint }?,
+	tickets: { Ticket }?,
+	loaded_at: number?,
+	busy: { [string]: boolean },
+	last: { [string]: number },
+	req: number,
+	error: string?,
+	form_error: string?,
+	list_error: string?,
+	cursor: string?,
+	-- The connection form is open while connected.
+	editing: boolean,
+	-- A project was just picked: open the board picker once its boards arrive (several).
+	want_board: boolean,
+}
 
 -- Popover state. `kind` is project, model or chat; `text` is the search
 -- field; `sel` is the highlighted item (0 = none); `dir`/`names` cache the last directory
@@ -199,6 +268,8 @@ type State = {
 	states_sig: string,
 	closed_panes: { [string]: boolean }?,
 	st_timer: TimerHandle?,
+	-- Key of the window showing this block, from window.luau's state events (nil until the first).
+	window: string?,
 	-- Counter of window.luau's "todo-proto.nudge" already handled (see `reload_if_nudged`).
 	nudge_seen: number,
 	-- When a pane was last seen working / launched by this block (os.time()).
@@ -240,13 +311,20 @@ type State = {
 	fsw: boolean,
 	-- The shared minute-aligned timer that refreshes the time labels.
 	tick: TimerHandle?,
+	-- The Tickets tab and the drafts of its connection form (URL, email, token). The token
+	-- draft is never saved: the window reads it off the masked field, then the block clears it.
+	jira: Jira,
+	jurl: Field,
+	jemail: Field,
+	jtoken: Field,
 }
 
 -- A pane ID survives Restart; the state object identifies this block run.
 local running: { [number]: State } = {}
 
--- Defined with the picker functions, which it needs.
+-- Defined with the picker functions, which they need.
 local open_settings: (State) -> ()
+local open_picker: (State, string) -> ()
 
 local CONFIRM_MS = 4000
 
@@ -291,6 +369,13 @@ local function alive(state: State): boolean
 	end
 	retire(state)
 	return false
+end
+
+-- Options for a `tern` command about this block's window. Without --window, $TERN_PANE (with
+-- its socket) or $TERN_WINDOW_KEY, the CLI acts on the first window, and the daemon starts the
+-- block's processes with none of them: a block in a second window opened its tabs in the first.
+local function in_window(state: State, timeout_ms: number): ProcessOptions
+	return { timeout_ms = timeout_ms, env = if state.window then { TERN_WINDOW_KEY = state.window } else nil }
 end
 
 local function live_panes(): { [number]: boolean }
@@ -374,6 +459,9 @@ local function parse(text: string): ({ Todo }?, string?)
 				created = str_or_nil(item.created),
 				updated = str_or_nil(item.updated),
 				completed = str_or_nil(item.completed),
+				jira = if type(item.jira) == "table" and str_or_nil(item.jira.key)
+					then { key = item.jira.key, url = str_or_nil(item.jira.url) }
+					else nil,
 			})
 		end
 	end
@@ -688,6 +776,48 @@ local function deep_equal(a: any, b: any): boolean
 	return true
 end
 
+-- Asks the window's Jira half (jira.luau) for `op`; the answer arrives as a "todo.jira" event
+-- (jira.answer). A request left unanswered for WAIT_MS is given up.
+function jira.ask(state: State, op: string, query: { [string]: string }?)
+	local j = state.jira
+	local slot = if op == "done" and query and query.key then "done:" .. query.key else op
+	j.req += 1
+	local req = j.req
+	-- `pane` lets the window answer this block even while its tab is hidden (the link's own
+	-- pane is then the window's focused one).
+	local q: { [string]: string | number } = { req = req, pane = state.cx.pane }
+	for k, v in query or {} do
+		q[k] = v
+	end
+	j.last[slot] = req
+	j.busy[slot] = true
+	local ok, err = pcall(function()
+		state.cx:open(jira.link.build(op, q))
+	end)
+	if not ok then
+		j.busy[slot] = nil
+		j.last[slot] = nil
+		state.cx:toast("error", "Cannot reach Jira", tostring(err))
+		return
+	end
+	tern.timer(jira.WAIT_MS, function()
+		if j.last[slot] ~= req or not alive(state) then
+			return
+		end
+		j.last[slot] = nil
+		j.busy[slot] = nil
+		local message = "No answer from Jira. Is a Tern window showing this block?"
+		if slot == "connect" then
+			j.form_error = message
+		elseif op == "done" then
+			state.cx:toast("error", "Could not close " .. tostring(query and query.key) .. " in Jira", message)
+		else
+			j.error = message
+		end
+		state.cx:render()
+	end)
+end
+
 -- Re-reads the file, lets `change` edit its `todos` array, and writes it back.
 -- Reading first keeps edits made elsewhere; known keys that are absent are filled in
 -- as explicit nulls (`due` is kept as it is, null when unset;
@@ -724,6 +854,8 @@ local function rewrite(state: State, change: ({ any }) -> boolean?): boolean
 	-- turned done gets `completed`, one that turned open loses it; new tasks get `created`.
 	-- Tasks the change left alone, and keys the block does not know, are not rewritten.
 	local now = iso_now()
+	-- Jira issues of tasks that turn done here; jira.luau closes them once the file is written.
+	local finished: { string } = {}
 	for _, item in list do
 		if type(item) == "table" and type(item.id) == "string" then
 			local before = snap[item.id]
@@ -738,6 +870,10 @@ local function rewrite(state: State, change: ({ any }) -> boolean?): boolean
 				item.updated = now
 				if item.done == true and before.done ~= true then
 					item.completed = now
+					local issue = item.jira
+					if type(issue) == "table" and type(issue.key) == "string" and issue.key ~= "" then
+						table.insert(finished, issue.key)
+					end
 				elseif item.done ~= true and before.done == true then
 					item.completed = nil
 				end
@@ -772,6 +908,9 @@ local function rewrite(state: State, change: ({ any }) -> boolean?): boolean
 		return false
 	end
 	load(state)
+	for _, key in finished do
+		jira.ask(state, "done", { key = key })
+	end
 	return true
 end
 
@@ -1191,7 +1330,14 @@ local function switch_tab(state: State, tab: string)
 	state.lift = nil
 	clear_sel(state)
 	state.anchor = nil
+	-- The connection form exists only on the Tickets tab.
+	if state.focus == "jurl" or state.focus == "jemail" or state.focus == "jtoken" then
+		state.focus = nil
+	end
 	ensure_cursor(state)
+	if tab == "tickets" then
+		jira.enter(state)
+	end
 end
 
 -- Moves tasks between the Tasks list and the Backlog; archived tasks stay where they are.
@@ -1665,7 +1811,7 @@ local function discover_session(state: State, task_id: string, pane: number, dea
 		local function retry()
 			discover_session(state, task_id, pane, deadline)
 		end
-		local ok = pcall(tern.process.run, { TERN, "inspect", "--json" }, { timeout_ms = 3000 }, function(found: ProcessResult, _)
+		local ok = pcall(tern.process.run, { TERN, "inspect", "--json" }, in_window(state, 3000), function(found: ProcessResult, _)
 			if not alive(state) then
 				return
 			end
@@ -1745,7 +1891,7 @@ local function launch(state: State, t: Todo, argv: { string }, find_session: boo
 		for _, a in argv do
 			table.insert(cmd, a)
 		end
-		local ok, err = pcall(tern.process.run, cmd, { timeout_ms = 10000 }, function(result: ProcessResult, _)
+		local ok, err = pcall(tern.process.run, cmd, in_window(state, 10000), function(result: ProcessResult, _)
 			state.launching[id] = nil
 			if result.status ~= 0 then
 				local first = string.match(result.stderr, "[^\n]+") or ("exit " .. result.status)
@@ -1762,7 +1908,7 @@ local function launch(state: State, t: Todo, argv: { string }, find_session: boo
 			end
 			if state.cfg.focus_on_start then
 				-- `tern new tab` leaves the new tab in the background: show it.
-				pcall(tern.process.run, { TERN, "focus", tostring(pane) }, { timeout_ms = 5000 }, function(shown: ProcessResult, _)
+				pcall(tern.process.run, { TERN, "focus", tostring(pane) }, in_window(state, 5000), function(shown: ProcessResult, _)
 					if shown.status ~= 0 then
 						state.cx:toast("error", "tern focus failed", shown.stderr)
 					end
@@ -2070,7 +2216,7 @@ local function activate(state: State, t: Todo)
 	local pane = live_pane_of(t)
 	if pane then
 		local ok, err = pcall(function()
-			tern.process.run({ TERN, "focus", tostring(pane) }, { timeout_ms = 5000 }, function(result: ProcessResult, _)
+			tern.process.run({ TERN, "focus", tostring(pane) }, in_window(state, 5000), function(result: ProcessResult, _)
 				if result.status ~= 0 then
 					state.cx:toast("error", "tern focus failed", result.stderr)
 				end
@@ -2276,7 +2422,7 @@ close_task_panes = function(state: State, set: { [string]: boolean }, commit: ({
 				settle()
 				continue
 			end
-			local ok = pcall(tern.process.run, { TERN, "close", tostring(g.pane) }, { timeout_ms = 5000 }, function(result: ProcessResult, _)
+			local ok = pcall(tern.process.run, { TERN, "close", tostring(g.pane) }, in_window(state, 5000), function(result: ProcessResult, _)
 				if result.status == 0 then
 					closed_panes += 1
 					for _, id in g.ids do
@@ -2320,13 +2466,13 @@ close_task_panes = function(state: State, set: { [string]: boolean }, commit: ({
 			leave(reason)
 			probed()
 		else
-			local ok = pcall(tern.process.run, { TERN, "process", "--json", tostring(g.pane) }, { timeout_ms = 5000 }, function(result: ProcessResult, _)
+			local ok = pcall(tern.process.run, { TERN, "process", "--json", tostring(g.pane) }, in_window(state, 5000), function(result: ProcessResult, _)
 				if result.status ~= 0 then
 					leave("cannot inspect it")
 					probed()
 					return
 				end
-				local inspected = pcall(tern.process.run, { TERN, "inspect", "--json" }, { timeout_ms = 5000 }, function(snapshot: ProcessResult, _)
+				local inspected = pcall(tern.process.run, { TERN, "inspect", "--json" }, in_window(state, 5000), function(snapshot: ProcessResult, _)
 					local decoded, catalog = pcall(tern.json.decode, snapshot.stdout)
 					local pane = nil
 					if snapshot.status == 0 and decoded and type(catalog) == "table" and type(catalog.panes) == "table" then
@@ -2985,6 +3131,14 @@ local function drop_fresh(state: State)
 	ensure_cursor(state)
 end
 
+-- The connection form's field `name` (jurl, jemail, jtoken); nil for any other focus.
+function jira.field(state: State, name: string?): Field?
+	return if name == "jurl" then state.jurl
+		elseif name == "jemail" then state.jemail
+		elseif name == "jtoken" then state.jtoken
+		else nil
+end
+
 local function set_focus(state: State, field: string?)
 	if state.focus == "add" and state.fresh and field ~= "add" and field ~= "picker" then
 		drop_fresh(state)
@@ -3026,6 +3180,8 @@ local function set_focus(state: State, field: string?)
 		id = "main.ws.detail.head.title_" .. state.title.rev
 	elseif field == "picker" and state.pick and SEARCH[state.pick.kind] then
 		id = "layer.q_" .. state.pick.q.rev
+	elseif field and jira.field(state, field) then
+		id = "main.ws.jform." .. field .. "_" .. (jira.field(state, field) :: Field).rev
 	end
 	state.cx:frame({ { "focus", id } })
 end
@@ -3068,7 +3224,7 @@ local function field_of(state: State, id: string): Field?
 		elseif state.focus == "notes" then state.notes
 		elseif state.focus == "title" then state.title
 		elseif state.focus == "picker" and state.pick then state.pick.q
-		else nil
+		else jira.field(state, state.focus)
 	return if f and f.id == id then f else nil
 end
 
@@ -3084,6 +3240,419 @@ local function field_changed(state: State)
 	elseif state.focus == "picker" and state.pick then
 		state.pick.sel = 0
 		state.pick.hint = nil
+	elseif jira.field(state, state.focus) then
+		state.jira.form_error = nil
+	end
+end
+
+-- Jira (Tickets tab) ------------------------------------------------------------
+
+function jira.new(): Jira
+	return {
+		conn = "unknown",
+		url = nil,
+		email = nil,
+		user = nil,
+		project = nil,
+		board = nil,
+		projects = nil,
+		boards = nil,
+		boards_for = nil,
+		sprints = nil,
+		tickets = nil,
+		loaded_at = nil,
+		busy = {},
+		last = {},
+		-- Counted from the clock, so a restarted block never takes an old run's answers.
+		req = math.floor(tern.now()),
+		error = nil,
+		form_error = nil,
+		list_error = nil,
+		cursor = nil,
+		editing = false,
+		want_board = false,
+	}
+end
+
+-- Takes the connection snapshot the window sends with most answers.
+function jira.apply_status(state: State, s: any)
+	local j = state.jira
+	j.conn = if s.connected == true then "connected" else "disconnected"
+	j.url, j.email, j.user = str_or_nil(s.url), str_or_nil(s.email), str_or_nil(s.user)
+	local p, b = s.project, s.board
+	local project: JiraProject? = if type(p) == "table" and str_or_nil(p.key)
+		then { key = p.key, name = str_or_nil(p.name) or p.key }
+		else nil
+	local board: JiraBoard? = if type(b) == "table" and type(b.id) == "number"
+		then { id = b.id, name = str_or_nil(b.name) or tostring(b.id), kind = str_or_nil(b.kind) }
+		else nil
+	if (if project then project.key else nil) ~= (if j.project then j.project.key else nil) then
+		j.boards, j.boards_for = nil, nil
+	end
+	if (if board then board.id else nil) ~= (if j.board then j.board.id else nil) or j.conn ~= "connected" then
+		j.sprints, j.tickets, j.loaded_at = nil, nil, nil
+	end
+	j.project, j.board = project, board
+	-- The form shows what is stored, unless the user is typing there.
+	if j.url and state.jurl.text == "" and state.focus ~= "jurl" then
+		reset_field(state.jurl, j.url)
+	end
+	if j.email and state.jemail.text == "" and state.focus ~= "jemail" then
+		reset_field(state.jemail, j.email)
+	end
+end
+
+-- Asks for what the Tickets tab shows next: the connection first, then the boards of a
+-- project without one, then the board's sprint (again after STALE_S, or now when `force`).
+function jira.load(state: State, force: boolean)
+	local j = state.jira
+	if j.conn == "unknown" or (force and j.conn == "disconnected") then
+		if not j.busy.status then
+			jira.ask(state, "status", nil)
+		end
+		return
+	end
+	if j.conn ~= "connected" then
+		return
+	end
+	if j.project and not j.board and j.boards_for ~= j.project.key and not j.busy.boards then
+		jira.ask(state, "boards", { project = j.project.key })
+	end
+	if j.board and not j.busy.sprint
+		and (force or j.tickets == nil or os.time() - (j.loaded_at or 0) >= jira.STALE_S) then
+		j.error = nil
+		jira.ask(state, "sprint", { board = tostring(j.board.id) })
+	end
+end
+
+function jira.enter(state: State)
+	jira.load(state, false)
+end
+
+function jira.choose_project(state: State, p: JiraProject)
+	local j = state.jira
+	if j.project and j.project.key == p.key then
+		return
+	end
+	j.project, j.board = p, nil
+	j.boards, j.boards_for = nil, nil
+	j.sprints, j.tickets, j.loaded_at = nil, nil, nil
+	j.error, j.list_error, j.cursor = nil, nil, nil
+	j.want_board = true
+	jira.ask(state, "select", { project = p.key, project_name = p.name })
+	jira.ask(state, "boards", { project = p.key })
+end
+
+function jira.choose_board(state: State, b: JiraBoard)
+	local j = state.jira
+	j.board = b
+	j.sprints, j.tickets, j.loaded_at = nil, nil, nil
+	j.error, j.cursor = nil, nil
+	local q: { [string]: string } = { board = tostring(b.id), board_name = b.name, board_kind = b.kind or "" }
+	if j.project then
+		q.project, q.project_name = j.project.key, j.project.name
+	end
+	jira.ask(state, "select", q)
+	jira.ask(state, "sprint", { board = tostring(b.id) })
+end
+
+function jira.task_for(state: State, key: string): Todo?
+	for _, t in state.todos do
+		if t.jira and t.jira.key == key then
+			return t
+		end
+	end
+	return nil
+end
+
+function jira.ticket(state: State, key: string?): Ticket?
+	for _, tk in state.jira.tickets or {} do
+		if tk.key == key then
+			return tk
+		end
+	end
+	return nil
+end
+
+-- The highlighted ticket; the first one when none is.
+function jira.selected(state: State): Ticket?
+	local j = state.jira
+	local tk = jira.ticket(state, j.cursor)
+	if not tk and j.tickets and j.tickets[1] then
+		tk = j.tickets[1]
+		j.cursor = tk.key
+	end
+	return tk
+end
+
+function jira.move(state: State, delta: number?, to: number?)
+	local list = state.jira.tickets or {}
+	local at = 0
+	for i, tk in list do
+		if tk.key == state.jira.cursor then
+			at = i
+		end
+	end
+	local tk = list[math.clamp(to or (at + (delta or 0)), 1, math.max(1, #list))]
+	if tk then
+		state.jira.cursor = tk.key
+	end
+end
+
+-- The next free "t<N>" id of the file's task list, as add_task picks it.
+function jira.free_id(list: { any }): string
+	local taken: { [string]: boolean } = {}
+	for _, item in list do
+		if type(item) == "table" and type(item.id) == "string" then
+			taken[item.id] = true
+		end
+	end
+	local n = #list + 1
+	while taken["t" .. n] do
+		n += 1
+	end
+	return "t" .. n
+end
+
+-- Adds the ticket as the first task, linked by `jira`. Returns the id of the ticket's task,
+-- also when another block added it first; nil when the file could not be written.
+function jira.add_task(state: State, tk: Ticket): string?
+	local url = if state.jira.url then state.jira.url .. "/browse/" .. tk.key else nil
+	local notes: { string } = {}
+	local description = if tk.description then trim(tk.description) else ""
+	if description ~= "" then
+		table.insert(notes, description)
+	end
+	if url then
+		table.insert(notes, url)
+	end
+	local cwd = last_project()
+	local id: string? = nil
+	local existing = false
+	local written = rewrite(state, function(list)
+		for _, item in list do
+			if type(item) == "table" and type(item.id) == "string" and type(item.jira) == "table" and item.jira.key == tk.key then
+				id, existing = item.id, true
+				return false
+			end
+		end
+		local new_id = jira.free_id(list)
+		id = new_id
+		table.insert(list, 1, {
+			id = new_id,
+			title = tk.key .. " " .. tk.summary,
+			notes = table.concat(notes, "\n\n"),
+			priority = "none",
+			due = tern.json.null,
+			done = false,
+			links = if cwd then { cwd = cwd } else {},
+			jira = { key = tk.key, url = url },
+		})
+		return true
+	end)
+	return if written or existing then id else nil
+end
+
+-- Shows the task on its tab with its card open.
+function jira.show_task(state: State, t: Todo)
+	switch_tab(state, if in_backlog(t) then "backlog" else "tasks")
+	if t.archived and state.cfg.archived then
+		state.arch_open = true
+	elseif t.done and state.cfg.done_group then
+		state.done_open = true
+	end
+	clear_sel(state)
+	state.cursor = t.id
+	state.anchor = t.id
+	state.detail_open = true
+	ensure_cursor(state)
+end
+
+-- Start / Enter (start) and Add to tasks / a: the ticket's task, made when missing. Starting
+-- then does what Enter does on that task: focus its pane, resume its chat or launch omp.
+function jira.ticket_task(state: State, tk: Ticket, start: boolean)
+	local t = jira.task_for(state, tk.key)
+	if not t then
+		local id = jira.add_task(state, tk)
+		t = if id then todo_by_id(state, id) else nil
+		if not t then
+			return
+		end
+		if not start then
+			state.cx:toast("success", "Added " .. tk.key .. " to tasks")
+		end
+	elseif not start then
+		jira.show_task(state, t)
+		return
+	end
+	if start then
+		activate(state, t)
+	end
+end
+
+function jira.open_issue(state: State, key: string)
+	local base = state.jira.url
+	if base then
+		state.cx:open(base .. "/browse/" .. key)
+	end
+end
+
+-- Connect / Save (or Enter in the form): the window checks and stores the connection; an empty
+-- token field keeps the stored token.
+function jira.connect(state: State)
+	local j = state.jira
+	if j.busy.connect then
+		return
+	end
+	local url = trim(state.jurl.text)
+	if url == "" then
+		j.form_error = "Enter your Jira URL, like https://your-company.atlassian.net."
+		return
+	end
+	if j.conn ~= "connected" and trim(state.jtoken.text) == "" then
+		j.form_error = "Paste an API token."
+		return
+	end
+	j.form_error = nil
+	jira.ask(state, "connect", { url = url, email = trim(state.jemail.text), field = state.jtoken.id or "" })
+end
+
+-- The connection form while connected (c, or the account pill); Esc or Cancel closes it.
+function jira.edit(state: State, on: boolean)
+	local j = state.jira
+	j.editing = on and j.conn == "connected"
+	j.form_error = nil
+	if not on then
+		reset_field(state.jtoken, "")
+		if jira.field(state, state.focus) then
+			set_focus(state, nil)
+		end
+	end
+end
+
+-- An answer of the window's Jira half (see jira.ask). Answers to an older request of the same
+-- slot, and the copies a second window sends, are dropped.
+function jira.answer(state: State, data: any)
+	if type(data) ~= "table" or type(data.op) ~= "string" then
+		return
+	end
+	local j = state.jira
+	local op: string = data.op
+	local key = str_or_nil(data.key)
+	local slot = if op == "done" and key then "done:" .. key else op
+	if j.last[slot] == nil or tonumber(data.req) ~= j.last[slot] then
+		return
+	end
+	j.last[slot] = nil
+	j.busy[slot] = nil
+	local err = str_or_nil(data.error)
+	if type(data.status) == "table" then
+		jira.apply_status(state, data.status)
+	end
+	if op == "connect" then
+		if err then
+			j.form_error = err
+			return
+		end
+		jira.edit(state, false)
+		state.cx:toast("success", "Connected to Jira", if j.user then "Signed in as " .. j.user else j.url)
+		jira.load(state, true)
+	elseif op == "forget" then
+		if err then
+			state.cx:toast("error", "Could not disconnect Jira", err)
+			return
+		end
+		jira.edit(state, false)
+		j.projects = nil
+		state.cx:toast("info", "Disconnected from Jira", "The token is removed from the keychain")
+	elseif op == "status" then
+		j.error = err
+		jira.load(state, false)
+	elseif op == "select" then
+		if err then
+			j.error = err
+		end
+	elseif op == "projects" then
+		j.list_error = err
+		if not err and type(data.projects) == "table" then
+			local list: { JiraProject } = {}
+			for _, p in data.projects do
+				if type(p) == "table" and str_or_nil(p.key) then
+					table.insert(list, { key = p.key, name = str_or_nil(p.name) or p.key })
+				end
+			end
+			j.projects = list
+		end
+	elseif op == "boards" then
+		j.list_error = err
+		local project = str_or_nil(data.project)
+		if err or type(data.boards) ~= "table" or not j.project or project ~= j.project.key then
+			return
+		end
+		local list: { JiraBoard } = {}
+		for _, b in data.boards do
+			if type(b) == "table" and type(b.id) == "number" then
+				table.insert(list, { id = b.id, name = str_or_nil(b.name) or tostring(b.id), kind = str_or_nil(b.kind) })
+			end
+		end
+		j.boards, j.boards_for = list, project
+		local wanted = j.want_board
+		j.want_board = false
+		if not j.board and #list == 1 then
+			jira.choose_board(state, list[1])
+		elseif not j.board and wanted and #list > 1 and state.tab == "tickets" and not state.pick and not state.focus then
+			open_picker(state, "jira_board")
+		end
+	elseif op == "sprint" then
+		if err then
+			j.error = err
+			return
+		end
+		if not j.board or tonumber(data.board) ~= j.board.id then
+			return
+		end
+		local sprints: { Sprint } = {}
+		for _, s in (if type(data.sprints) == "table" then data.sprints else {}) do
+			if type(s) == "table" and type(s.id) == "number" then
+				table.insert(sprints, { id = s.id, name = str_or_nil(s.name) or tostring(s.id), ends = str_or_nil(s.ends) })
+			end
+		end
+		local tickets: { Ticket } = {}
+		for _, t in (if type(data.tickets) == "table" then data.tickets else {}) do
+			if type(t) == "table" and str_or_nil(t.key) then
+				table.insert(tickets, {
+					key = t.key,
+					summary = str_or_nil(t.summary) or t.key,
+					status = str_or_nil(t.status) or "Unknown",
+					category = str_or_nil(t.category) or "new",
+					kind = str_or_nil(t.kind),
+					assignee = str_or_nil(t.assignee),
+					priority = str_or_nil(t.priority),
+					description = str_or_nil(t.description),
+					sprint = str_or_nil(t.sprint),
+				})
+			end
+		end
+		j.sprints, j.tickets, j.loaded_at, j.error = sprints, tickets, os.time(), nil
+		if not jira.ticket(state, j.cursor) then
+			j.cursor = if tickets[1] then tickets[1].key else nil
+		end
+	elseif op == "done" and key then
+		if err then
+			state.cx:toast("error", "Could not close " .. key .. " in Jira", err)
+			return
+		end
+		local status = str_or_nil(data.jira_status) or "Done"
+		for _, tk in j.tickets or {} do
+			if tk.key == key then
+				tk.status, tk.category = status, "done"
+			end
+		end
+		if data.already == true then
+			state.cx:toast("info", key .. " is already " .. status .. " in Jira")
+		else
+			state.cx:toast("success", "Closed " .. key .. " in Jira", "Status: " .. status)
+		end
 	end
 end
 
@@ -3224,10 +3793,53 @@ local function project_items(state: State, pk: Pick, t: Todo): ({ PickItem }, st
 	return items, if #items == 0 then "No matching projects" else nil
 end
 
+-- Rows of the Jira project and board popovers (Tickets tab; no task needed).
+function jira.pick_items(state: State, pk: Pick): ({ PickItem }, string?)
+	local j = state.jira
+	local filter = string.lower(pk.q.text)
+	local items: { PickItem } = {}
+	if pk.kind == "jira_project" then
+		if not j.projects then
+			return items, if j.busy.projects then "Loading projects…" else (j.list_error or "No projects")
+		end
+		for _, p in j.projects do
+			if filter == "" or contains(p.name, filter) or contains(p.key, filter) then
+				table.insert(items, {
+					kind = "opt",
+					path = p.key,
+					name = p.name,
+					hint = p.key,
+					current = j.project ~= nil and j.project.key == p.key,
+				})
+			end
+		end
+		return items, if #items == 0 then "No matching projects" else nil
+	end
+	local boards = if j.project and j.boards_for == j.project.key then j.boards else nil
+	if not boards then
+		return items, if j.busy.boards then "Loading boards…" else (j.list_error or "No boards")
+	end
+	for _, b in boards do
+		if filter == "" or contains(b.name, filter) then
+			table.insert(items, {
+				kind = "opt",
+				path = tostring(b.id),
+				name = b.name,
+				hint = b.kind,
+				current = j.board ~= nil and j.board.id == b.id,
+			})
+		end
+	end
+	return items, if #items > 0 then nil elseif #boards == 0 then "This project has no boards" else "No matching boards"
+end
+
 -- Rows of the open popover and a status line shown when there are none.
 local function picker_items(state: State): ({ PickItem }, string?)
 	local pk = state.pick
 	local items: { PickItem } = {}
+	if pk and (pk.kind == "jira_project" or pk.kind == "jira_board") then
+		return jira.pick_items(state, pk)
+	end
 	local t = selected(state)
 	if not pk or not t then
 		return items, nil, 0
@@ -3310,15 +3922,18 @@ open_settings = function(state: State)
 	state.settings_open = true
 end
 
-local function open_picker(state: State, kind: string)
+open_picker = function(state: State, kind: string)
+	local is_jira = kind == "jira_project" or kind == "jira_board"
 	local t = selected(state)
-	if not t then
+	if not t and not is_jira then
 		return
 	end
-	state.detail_open = true
+	if not is_jira then
+		state.detail_open = true
+	end
 	state.pick = {
 		kind = kind,
-		task = t.id,
+		task = if t then t.id else "",
 		q = new_field("", false, nil),
 		sel = 0,
 		dir = nil,
@@ -3327,10 +3942,17 @@ local function open_picker(state: State, kind: string)
 		want = nil,
 		hint = nil,
 	}
+	local j = state.jira
 	if kind == "model" then
 		load_models(state)
-	elseif kind == "chat" then
+	elseif kind == "chat" and t then
 		scan_chats(state, t.links.cwd)
+	elseif kind == "jira_project" and not j.busy.projects then
+		j.list_error = nil
+		jira.ask(state, "projects", nil)
+	elseif kind == "jira_board" and j.project and not j.busy.boards and j.boards_for ~= j.project.key then
+		j.list_error = nil
+		jira.ask(state, "boards", { project = j.project.key })
 	end
 	local initial = picker_items(state)
 	for i, it in initial do
@@ -3347,6 +3969,21 @@ local function apply_pick(state: State, kind: string, value: string?)
 	local pk = state.pick
 	close_picker(state)
 	if not pk then
+		return
+	end
+	if kind == "jira_project" then
+		for _, p in state.jira.projects or {} do
+			if p.key == value then
+				jira.choose_project(state, p)
+			end
+		end
+		return
+	elseif kind == "jira_board" then
+		for _, b in state.jira.boards or {} do
+			if tostring(b.id) == value then
+				jira.choose_board(state, b)
+			end
+		end
 		return
 	end
 	if kind == "project" then
@@ -3458,6 +4095,25 @@ local function field_key(state: State, key: Key): boolean
 		end
 		return true
 	end
+	local jf = jira.field(state, state.focus)
+	if jf then
+		local what = edit_key(jf, key, state.cx)
+		if what == nil then
+			return false
+		elseif what == "submit" then
+			jira.connect(state)
+		elseif what == "blur" and key.name == "tab" then
+			-- Tab and Shift+Tab walk the form's three fields.
+			local order = { "jurl", "jemail", "jtoken" }
+			local at = table.find(order, state.focus) or 1
+			set_focus(state, order[(at - 1 + (if key.shift then -1 else 1)) % #order + 1])
+		elseif what == "blur" then
+			set_focus(state, nil)
+		elseif what == "text" then
+			state.jira.form_error = nil
+		end
+		return true
+	end
 	if not selected(state) then
 		set_focus(state, nil)
 		return true
@@ -3493,7 +4149,15 @@ local function el(tag: string, role: string, key: string, props: { [string]: any
 	return ui.el(tag, p, children)
 end
 
-local FIELD_IDS = { field = "main.ws.left.add.field", notes = "main.ws.detail.notes", title = "main.ws.detail.head.title", q = "layer.q" }
+local FIELD_IDS = {
+	field = "main.ws.left.add.field",
+	notes = "main.ws.detail.notes",
+	title = "main.ws.detail.head.title",
+	q = "layer.q",
+	jurl = "main.ws.jform.jurl",
+	jemail = "main.ws.jform.jemail",
+	jtoken = "main.ws.jform.jtoken",
+}
 
 -- A text field node whose text, caret and selection come from `f` while it is being
 -- edited, else from `idle` with the caret at its end.
@@ -3566,6 +4230,9 @@ local function badges(t: Todo, live: { [number]: boolean }): { Node }
 	end
 	if t.links.omp_session then
 		table.insert(out, el("span", "badge", "omp", { text = "omp", tone = "accent" }))
+	end
+	if t.jira then
+		table.insert(out, el("span", "badge", "jira", { text = t.jira.key, attrs = { ["data-kind"] = "jira" } }))
 	end
 	return out
 end
@@ -3709,6 +4376,22 @@ local function gear_button(): Node
 	})
 end
 
+-- Tasks · Backlog · Tickets: the tab strip of every tab.
+function jira.tabs(state: State): Node
+	local function tab(id: string, text: string): Node
+		return el("button", "tabbtn", "tab-" .. id, {
+			text = text,
+			attrs = { ["data-active"] = if state.tab == id then "true" else "false" },
+			actions = { click = "tab=" .. id },
+		})
+	end
+	local tickets = state.jira.tickets
+	return el("div", "tabs", "tabs", nil, {
+		tab("tasks", "Tasks"),
+		tab("backlog", "Backlog (" .. backlog_count(state) .. ")"),
+		tab("tickets", if tickets then "Tickets (" .. #tickets .. ")" else "Tickets"),
+	})
+end
 
 local function left_view(state: State): Node
 	local open = open_count(state)
@@ -3723,18 +4406,7 @@ local function left_view(state: State): Node
 	if picked_n >= 2 then
 		subtitle ..= " · " .. picked_n .. " selected"
 	end
-	local tabs = el("div", "tabs", "tabs", nil, {
-		el("button", "tabbtn", "tab-tasks", {
-			text = "Tasks",
-			attrs = { ["data-active"] = if backlog_tab then "false" else "true" },
-			actions = { click = "tab=tasks" },
-		}),
-		el("button", "tabbtn", "tab-backlog", {
-			text = "Backlog (" .. backlog_count(state) .. ")",
-			attrs = { ["data-active"] = if backlog_tab then "true" else "false" },
-			actions = { click = "tab=backlog" },
-		}),
-	})
+	local tabs = jira.tabs(state)
 	local head = el("div", "head", "head", nil, {
 		el("div", "heading", "heading", { text = if backlog_tab then "Backlog" else "Tasks" }),
 		el("div", "subtitle", "subtitle", { text = subtitle }),
@@ -3803,8 +4475,20 @@ end
 -- The popover is Tern's own picker sheet (the one omp's model and session pickers use): it
 -- sits in the block's layer, centred and sized to the block, so it cannot be clipped at the
 -- block's edges, and it virtualizes and scrolls its rows itself (wheel included).
-local PICK_TITLE: { [string]: string } = { project = "Project", model = "Model", chat = "Chat" }
-local PICK_NOUN: { [string]: string } = { project = "projects", model = "models", chat = "chats" }
+local PICK_TITLE: { [string]: string } = {
+	project = "Project",
+	model = "Model",
+	chat = "Chat",
+	jira_project = "Jira",
+	jira_board = "Board",
+}
+local PICK_NOUN: { [string]: string } = {
+	project = "projects",
+	model = "models",
+	chat = "chats",
+	jira_project = "projects",
+	jira_board = "boards",
+}
 
 local function picker_node(state: State): Node?
 	local pk = state.pick
@@ -4024,6 +4708,348 @@ local function detail_view(state: State, t: Todo): Node
 	return el("div", "detail", "detail", {
 		attrs = { ["data-focus"] = if state.focus == "notes" then "notes" else "none" },
 	}, head)
+end
+
+-- Tickets tab ---------------------------------------------------------------
+
+-- "Fri 14 Nov" of an ISO stamp; nil when it is not one.
+function jira.short_date(iso: string?): string?
+	local ts = parse_iso(iso)
+	return if ts then os.date("%a %d %b", ts) else nil
+end
+
+-- A sprint ticket: its task's status glyph once it has a task, else open/done by Jira.
+function jira.row(state: State, tk: Ticket, live: { [number]: boolean }): Node
+	local t = jira.task_for(state, tk.key)
+	local kind = if t then status_of(state, t, live) elseif tk.category == "done" then "done" else "todo"
+	local meta: { Node } = {
+		el("span", "badge", "key", { text = tk.key, attrs = { ["data-kind"] = "jira" } }),
+		el("span", "badge", "status", { text = tk.status, tone = jira.TONE[tk.category] or "muted" }),
+	}
+	if tk.assignee then
+		table.insert(meta, el("span", "jmeta", "who", { text = tk.assignee }))
+	end
+	if t then
+		local line = if t.done then "Task done" else agent_line(state, t, kind) or "In tasks"
+		table.insert(meta, el("div", "agent-line", "line", { text = line, attrs = { ["data-kind"] = kind } }))
+	end
+	return el("div", "row", tk.key, {
+		attrs = {
+			["data-state"] = if state.jira.cursor == tk.key then "selected" else "idle",
+			["data-done"] = if tk.category == "done" then "true" else "false",
+		},
+		actions = { click = "tsel=" .. tk.key, dblclick = "topen=" .. tk.key },
+	}, {
+		el("span", "check", "check", { attrs = { ["data-status"] = kind } }),
+		el("div", "rowtext", "text", nil, {
+			el("div", "title", "title", { text = tk.summary }),
+			el("div", "meta", "meta", nil, meta),
+		}),
+	})
+end
+
+function jira.left(state: State): Node
+	local j = state.jira
+	local tickets = j.tickets
+	local subtitle = ""
+	-- The line in place of the rows: what to do next, or why there are none.
+	local note: string? = nil
+	if j.conn == "unknown" then
+		subtitle = "Checking Jira…"
+	elseif j.conn ~= "connected" then
+		subtitle = "Not connected"
+		note = "Connect Jira with the form on the right to see the current sprint here."
+	elseif not j.project then
+		subtitle = if j.user then "Signed in as " .. j.user else "Connected"
+		note = "Pick the Jira project, then its board."
+	elseif not j.board then
+		subtitle = j.project.name
+		note = if j.busy.boards then "Loading boards…" else "Pick a board of " .. j.project.name .. "."
+	elseif not tickets then
+		subtitle = j.board.name
+		note = if j.busy.sprint then "Loading the sprint…" else nil
+	else
+		local sprints = j.sprints or {}
+		if #sprints == 0 then
+			subtitle = j.board.name
+			note = "No active sprint on " .. j.board.name .. "."
+		else
+			local names: { string } = {}
+			for _, s in sprints do
+				table.insert(names, s.name)
+			end
+			subtitle = table.concat(names, ", ") .. " · " .. plural(#tickets, "ticket")
+			local ends = if #sprints == 1 then jira.short_date(sprints[1].ends) else nil
+			if ends then
+				subtitle ..= " · ends " .. ends
+			end
+			if #tickets == 0 then
+				note = "The sprint has no tickets."
+			end
+		end
+	end
+	local kids: { Node } = {
+		el("div", "head", "head", nil, {
+			el("div", "heading", "heading", { text = "Tickets" }),
+			el("div", "subtitle", "subtitle", { text = subtitle }),
+			jira.tabs(state),
+		}),
+	}
+	if j.conn == "connected" then
+		local bar: { Node } = {
+			pill_box(state, "jira_project", "jproject", if j.project then j.project.name else "Pick a project", if j.project then nil else "muted", nil),
+		}
+		if j.project then
+			table.insert(bar, pill_box(state, "jira_board", "jboard", if j.board then j.board.name else "Pick a board", if j.board then nil else "muted", nil))
+		end
+		table.insert(bar, el("button", "hbtn", "jrefresh", {
+			aria = "Reload the sprint",
+			title = "Reload the sprint (r)",
+			attrs = { ["data-kind"] = "refresh", ["data-busy"] = if j.busy.sprint then "true" else "false" },
+			actions = { click = "jrefresh" },
+		}))
+		table.insert(bar, el("button", "pillbtn", "jaccount", {
+			text = j.user or j.email or "Jira",
+			title = (j.url or "") .. " · edit the connection (c)",
+			attrs = { ["data-icon"] = "jira", ["data-chev"] = "no", ["data-open"] = if j.editing then "true" else "false" },
+			actions = { click = "jedit" },
+		}))
+		table.insert(kids, el("div", "jbar", "jbar", nil, bar))
+	end
+	local rows: { Node } = {}
+	if j.error then
+		table.insert(rows, el("div", "jnote", "error", { text = j.error, attrs = { ["data-tone"] = "error" } }))
+	end
+	if note then
+		table.insert(rows, el("div", "jnote", "note", { text = note }))
+	end
+	local live = live_panes()
+	for _, tk in tickets or {} do
+		table.insert(rows, jira.row(state, tk, live))
+	end
+	table.insert(kids, el("div", "rows", "rows", { attrs = { ["data-lift"] = "off" } }, rows))
+	return el("div", "left", "left", nil, kids)
+end
+
+function jira.card(state: State, tk: Ticket): Node
+	local t = jira.task_for(state, tk.key)
+	local chips: { Node } = {
+		el("span", "badge", "key", { text = tk.key, attrs = { ["data-kind"] = "jira" } }),
+		el("span", "badge", "status", { text = tk.status, tone = jira.TONE[tk.category] or "muted" }),
+	}
+	if tk.kind then
+		table.insert(chips, el("span", "badge", "type", { text = tk.kind }))
+	end
+	if tk.priority then
+		table.insert(chips, el("span", "badge", "prio", { text = tk.priority }))
+	end
+	local facts: { string } = { if tk.assignee then "Assignee: " .. tk.assignee else "Unassigned" }
+	if tk.sprint then
+		table.insert(facts, tk.sprint)
+	end
+	local kids: { Node } = {
+		el("div", "detail-head", "head", nil, {
+			el("div", "jtitle", "title", { text = tk.summary }),
+		}),
+		el("div", "meta", "chips", nil, chips),
+		el("div", "jfacts", "facts", { text = table.concat(facts, " · ") }),
+	}
+	if t then
+		local kind = status_of(state, t, live_panes())
+		local line = if t.done then "Its task is done" else agent_line(state, t, kind) or "In your tasks"
+		table.insert(kids, el("div", "chiprow", "taskchip", nil, {
+			el("span", "statuschip", "chip", { text = line, attrs = { ["data-kind"] = kind } }),
+		}))
+	end
+	table.insert(kids, el("div", "jdesc", "desc", {
+		text = tk.description or "No description.",
+		attrs = { ["data-empty"] = if tk.description then "false" else "true" },
+	}))
+	local buttons: { Node } = {
+		el("button", "pill", "jira", { text = "Open in Jira", actions = { click = "tjira=" .. tk.key } }),
+		el("button", "pill", "task", {
+			text = if t then "Go to task" else "Add to tasks",
+			actions = { click = (if t then "tgoto=" else "tadd=") .. tk.key },
+		}),
+	}
+	if t and t.done and tk.category ~= "done" then
+		table.insert(buttons, el("button", "pill", "close", {
+			text = if state.jira.busy["done:" .. tk.key] then "Closing…" else "Close in Jira",
+			actions = { click = "tclose=" .. tk.key },
+		}))
+	end
+	table.insert(buttons, el("button", "pill", "start", {
+		text = if t then primary_label(t) else "Start",
+		actions = { click = "tstart=" .. tk.key },
+	}))
+	table.insert(kids, el("div", "jbuttons", "buttons", nil, buttons))
+	return el("div", "detail", "detail", { attrs = { ["data-focus"] = "none" } }, kids)
+end
+
+-- The connection form. Its fields keep FIELD_IDS' paths (direct children of "jform").
+function jira.form(state: State): Node
+	local j = state.jira
+	local connected = j.conn == "connected"
+	local head: { Node } = { el("div", "jtitle", "title", { text = if connected then "Jira connection" else "Connect Jira" }) }
+	if connected then
+		table.insert(head, el("button", "close", "close", { aria = "Close", title = "Close (Esc)", actions = { click = "jcancel" } }))
+	end
+	local kids: { Node } = {
+		el("div", "detail-head", "head", nil, head),
+		el("div", "jhelp", "help", {
+			text = "Jira Cloud: your Atlassian email and an API token. Jira Data Center: leave the email empty "
+				.. "and use a personal access token. The token is kept in the system keychain.",
+		}),
+		el("div", "jlabel", "lurl", { text = "Jira URL" }),
+		field_node("input", {
+			key = "jurl",
+			role = ROLE .. "jfield",
+			placeholder = "https://your-company.atlassian.net",
+			aria = "Jira URL",
+		}, state.jurl, ""),
+		el("div", "jlabel", "lemail", { text = "Email" }),
+		field_node("input", {
+			key = "jemail",
+			role = ROLE .. "jfield",
+			placeholder = "you@company.com",
+			aria = "Email",
+		}, state.jemail, ""),
+		el("div", "jlabel", "ltoken", { text = "API token" }),
+		field_node("input", {
+			key = "jtoken",
+			role = ROLE .. "jira-token",
+			secret = true,
+			placeholder = if connected then "Kept in the keychain; paste a new one to replace it" else "Paste the token",
+			aria = "API token",
+		}, state.jtoken, ""),
+	}
+	if j.form_error then
+		table.insert(kids, el("div", "jnote", "error", { text = j.form_error, attrs = { ["data-tone"] = "error" } }))
+	end
+	local buttons: { Node } = {
+		el("button", "pill", "token", { text = "Create a token", actions = { click = "jtokenpage" } }),
+	}
+	if connected then
+		table.insert(buttons, el("button", "pill", "forget", {
+			text = if j.busy.forget then "Disconnecting…" else "Disconnect",
+			actions = { click = "jforget" },
+		}))
+	end
+	table.insert(buttons, el("button", "pill", "connect", {
+		text = if j.busy.connect then "Checking…" elseif connected then "Save" else "Connect",
+		actions = { click = "jconnect" },
+	}))
+	table.insert(kids, el("div", "jbuttons", "buttons", nil, buttons))
+	return el("div", "detail", "jform", { attrs = { ["data-focus"] = "none" } }, kids)
+end
+
+-- Keys on the Tickets tab while no field has focus.
+function jira.key(state: State, key: Key): boolean
+	if key.ctrl or key.alt or key.meta then
+		return false
+	end
+	local j = state.jira
+	local k = key.text or key.name
+	local connected = j.conn == "connected"
+	local tk = jira.selected(state)
+	if key.name == "up" or k == "k" then
+		jira.move(state, -1, nil)
+	elseif key.name == "down" or k == "j" then
+		jira.move(state, 1, nil)
+	elseif key.name == "home" or k == "g" then
+		jira.move(state, nil, 1)
+	elseif key.name == "end" or k == "G" then
+		jira.move(state, nil, #(j.tickets or {}))
+	elseif key.name == "enter" then
+		if tk and not j.editing then
+			jira.ticket_task(state, tk, true)
+		end
+	elseif k == "a" then
+		if tk then
+			jira.ticket_task(state, tk, false)
+		end
+	elseif k == "o" then
+		if tk then
+			jira.open_issue(state, tk.key)
+		end
+	elseif k == "r" then
+		jira.load(state, true)
+	elseif k == "p" then
+		if connected then
+			open_picker(state, "jira_project")
+		end
+	elseif k == "b" then
+		if connected and j.project then
+			open_picker(state, "jira_board")
+		end
+	elseif k == "c" then
+		jira.edit(state, true)
+		set_focus(state, "jurl")
+	elseif key.name == "escape" and j.editing then
+		jira.edit(state, false)
+	elseif k == "," then
+		open_settings(state)
+	elseif k == "T" then
+		switch_tab(state, "tasks")
+	elseif k == "B" then
+		switch_tab(state, "backlog")
+	else
+		return false
+	end
+	return true
+end
+
+-- Clicks on the Tickets tab; false for actions it does not own.
+function jira.event(state: State, act: any, value: any): boolean
+	local j = state.jira
+	local tk = if type(value) == "string" then jira.ticket(state, value) else nil
+	if act == "tsel" or act == "topen" then
+		if not tk then
+			return true
+		end
+		j.cursor = tk.key
+		if j.editing then
+			jira.edit(state, false)
+		end
+		refresh_cfg(state)
+		if act == "topen" and state.cfg.dblclick then
+			jira.ticket_task(state, tk, true)
+		end
+	elseif act == "tstart" or act == "tadd" then
+		if tk then
+			jira.ticket_task(state, tk, act == "tstart")
+		end
+	elseif act == "tgoto" then
+		local t = if type(value) == "string" then jira.task_for(state, value) else nil
+		if t then
+			jira.show_task(state, t)
+		end
+	elseif act == "tjira" then
+		if type(value) == "string" then
+			jira.open_issue(state, value)
+		end
+	elseif act == "tclose" then
+		if type(value) == "string" and not j.busy["done:" .. value] then
+			jira.ask(state, "done", { key = value })
+		end
+	elseif act == "jconnect" then
+		jira.connect(state)
+	elseif act == "jedit" then
+		jira.edit(state, not j.editing)
+	elseif act == "jcancel" then
+		jira.edit(state, false)
+	elseif act == "jforget" then
+		if not j.busy.forget then
+			jira.ask(state, "forget", nil)
+		end
+	elseif act == "jrefresh" then
+		jira.load(state, true)
+	elseif act == "jtokenpage" then
+		state.cx:open(jira.TOKEN_PAGE)
+	else
+		return false
+	end
+	return true
 end
 
 -- The modifier keys held during a click, as a set (Tern lists shift/ctrl/alt/meta).
@@ -4250,6 +5276,10 @@ tern.block.define("list", {
 			sess_busy = false,
 			fsw = false,
 			tick = nil,
+			jira = jira.new(),
+			jurl = new_field("", false, nil),
+			jemail = new_field("", false, nil),
+			jtoken = new_field("", false, nil),
 		}
 		running[cx.pane] = state
 		if not saved and state.path and string.sub(state.path, 1, 1) == "/" then
@@ -4288,17 +5318,36 @@ tern.block.define("list", {
 			return { main = root({ card }) }
 		end
 		refresh_cfg(state)
-		local cols: { Node } = { left_view(state) }
-		local t = selected(state)
-		local picked_ids = multi_ids(state)
-		if #picked_ids >= 2 then
-			table.insert(cols, bulk_view(state, picked_ids))
-		elseif t and state.detail_open then
-			table.insert(cols, detail_view(state, t))
+		local cols: { Node } = {}
+		if state.tab == "tickets" then
+			local j = state.jira
+			table.insert(cols, jira.left(state))
+			if j.conn == "disconnected" or j.editing then
+				table.insert(cols, jira.form(state))
+			elseif j.conn == "connected" then
+				local tk = jira.selected(state)
+				if tk then
+					table.insert(cols, jira.card(state, tk))
+				end
+			end
+		else
+			table.insert(cols, left_view(state))
+			local t = selected(state)
+			local picked_ids = multi_ids(state)
+			if #picked_ids >= 2 then
+				table.insert(cols, bulk_view(state, picked_ids))
+			elseif t and state.detail_open then
+				table.insert(cols, detail_view(state, t))
+			end
 		end
+		local jira_pick = state.pick ~= nil and (state.pick.kind == "jira_project" or state.pick.kind == "jira_board")
 		local hint = el("div", "hint", "hint", {
-				text = if state.focus == "picker"
+				text = if state.focus == "picker" and jira_pick
+					then "↑↓ choose  ·  type to search  ·  ⏎ pick  ·  Esc close"
+					elseif state.focus == "picker"
 					then "↑↓ PgUp PgDn choose  ·  Tab complete path  ·  ⏎ pick  ·  Esc close"
+					elseif jira.field(state, state.focus)
+					then "Enter connect  ·  Tab next field  ·  Esc leave field"
 					elseif state.focus == "title"
 					then "Enter save  ·  Esc cancel"
 					elseif state.focus == "notes"
@@ -4307,9 +5356,11 @@ tern.block.define("list", {
 					then "Enter " .. (if state.focus == "add" then "add task" else "new line") .. "  ·  Esc leave field"
 					else if state.lift
 						then "Click a task to move it there  ·  click the grip or Esc to cancel"
+						elseif state.tab == "tickets"
+						then "j/k move  ·  ⏎ start  ·  a add to tasks  ·  o open in Jira  ·  r reload  ·  p project  ·  b board  ·  c connection  ·  T tasks  ·  , settings"
 						elseif next(state.sel) ~= nil
 						then "⇧↑↓ extend  ·  v mark  ·  ⌘A all  ·  space done  ·  b backlog  ·  z archive  ·  ⌫⌫ delete  ·  Esc clear  ·  , settings"
-						else "j/k move  ·  space done  ·  ⏎ open  ·  Tab add  ·  e notes  ·  F2 rename  ·  p project  ·  b backlog  ·  B tab  ·  z archive  ·  ⌫ delete  ·  v select  ·  , settings",
+						else "j/k move  ·  space done  ·  ⏎ open  ·  Tab add  ·  e notes  ·  F2 rename  ·  p project  ·  b backlog  ·  B tab  ·  T tickets  ·  z archive  ·  ⌫ delete  ·  v select  ·  , settings",
 		})
 		local dockkids: { Node } = {}
 		if state.cfg.hints then
@@ -4339,6 +5390,9 @@ tern.block.define("list", {
 		end
 		if state.focus then
 			return field_key(state, key)
+		end
+		if state.tab == "tickets" then
+			return jira.key(state, key)
 		end
 		if key.shift and not (key.ctrl or key.alt or key.meta) and (key.name == "up" or key.name == "down") then
 			extend(state, if key.name == "up" then -1 else 1)
@@ -4412,6 +5466,8 @@ tern.block.define("list", {
 			end
 		elseif k == "B" then
 			switch_tab(state, if state.tab == "backlog" then "tasks" else "backlog")
+		elseif k == "T" then
+			switch_tab(state, "tickets")
 		elseif k == "Z" then
 			toggle_archived(state)
 		elseif key.name == "delete" or key.name == "backspace" then
@@ -4453,9 +5509,18 @@ tern.block.define("list", {
 				state.agent_states = states
 				state.states_at = tern.now()
 			end
+			if type(ev.window) == "string" then
+				state.window = ev.window
+			end
 			return
 		elseif ev.ev == "action" and ev.act == "todo.settings" then
 			open_settings(state)
+			return
+		elseif ev.ev == "action" and ev.act == jira.link.ACT then
+			local ok, data = pcall(tern.json.decode, if type(ev.json) == "string" then ev.json else "")
+			if ok then
+				jira.answer(state, data)
+			end
 			return
 		end
 		if state.settings_open then
@@ -4489,6 +5554,8 @@ tern.block.define("list", {
 				set_focus(state, "notes")
 			elseif tail == "title" then
 				set_focus(state, "title")
+			elseif tail == "jurl" or tail == "jemail" or tail == "jtoken" then
+				set_focus(state, tail)
 			end
 			return
 		end
@@ -4519,6 +5586,9 @@ tern.block.define("list", {
 		local act, value = ev.act, ev.value
 		if state.focus == "title" or state.focus == "notes" then
 			set_focus(state, nil)
+		end
+		if jira.event(state, act, value) then
+			return
 		end
 		local t = selected(state)
 		-- Anything but a row click, the grip or a row double click puts a picked-up task down.
@@ -4668,7 +5738,7 @@ tern.block.define("list", {
 			close_picker(state)
 		elseif act == "pick-use" and state.pick then
 			picker_key(state, { name = "enter" } :: any)
-		elseif act == "tab" and (value == "tasks" or value == "backlog") then
+		elseif act == "tab" and (value == "tasks" or value == "backlog" or value == "tickets") then
 			switch_tab(state, value)
 		elseif act == "rdone" and type(value) == "string" then
 			if repeated(state, "rdone=" .. value) then

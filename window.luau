@@ -1,5 +1,6 @@
 --!strict
 local remote = require("./remote")
+require("./jira")
 local BLOCK = "todo-proto.list"
 local SAMPLE_MS = 200
 local KEEPALIVE_MS = 4000
@@ -301,7 +302,13 @@ local function deliver()
 				if snapshots[host] == snapshot and (last == nil or last.generation ~= snapshot.generation or last.signature ~= snapshot.signature
 					or now - last.sent >= KEEPALIVE_MS) then
 					local sent = pcall(function()
-						sample_cx.session:event(snapshot.destinations[pane], { ev = "action", act = "todo.states", json = snapshot.json })
+						-- `window` tells the block which window shows it, for its `tern` commands.
+						sample_cx.session:event(snapshot.destinations[pane], {
+							ev = "action",
+							act = "todo.states",
+							json = snapshot.json,
+							window = sample_cx:window_key(),
+						})
 					end)
 					if sent then
 						deliveries[pane] = { generation = snapshot.generation, signature = snapshot.signature, sent = now }

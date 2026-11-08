@@ -890,6 +890,142 @@
 		font-variant-numeric: tabular-nums;
 		color: var(--tp-mute);
 	}
+
+	/* Tickets tab (Jira). */
+	& [data-role='todo-proto.badge'][data-kind='jira'] {
+		background: rgb(76 154 255 / 14%);
+		color: #4c9aff;
+		font-variant-numeric: tabular-nums;
+	}
+
+	& [data-role='todo-proto.jbar'] {
+		display: flex;
+		flex-direction: row;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+		margin-top: 30px;
+		padding: 0 18px;
+	}
+
+	& [data-role='todo-proto.jbar'] [data-role='todo-proto.pillbtn'] {
+		flex: 0 1 auto;
+		min-width: 0;
+	}
+
+	/* The account pill: a green dot for the live connection, pushed to the bar's end. */
+	& [data-role='todo-proto.pillbtn'][data-icon='jira'] {
+		margin-left: auto;
+		padding-left: 30px;
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='4' fill='%233fb950'/%3E%3C/svg%3E");
+		background-size: 16px 16px;
+		background-position: 10px 50%;
+	}
+
+	& [data-role='todo-proto.hbtn'][data-kind='refresh'] {
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239096a8' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M19 12a7 7 0 1 1-2.05-4.95'/%3E%3Cpath d='M19 4.5V9h-4.5'/%3E%3C/svg%3E");
+	}
+
+	& [data-role='todo-proto.hbtn'][data-kind='refresh'][data-busy='true'] {
+		animation: tp-spin 1s linear infinite;
+	}
+
+	& [data-role='todo-proto.jnote'] {
+		padding: 14px 18px;
+		font-size: 14px;
+		line-height: 1.5;
+		color: var(--tp-mute);
+	}
+
+	& [data-role='todo-proto.jnote'][data-tone='error'] {
+		color: var(--bad);
+	}
+
+	& [data-role='todo-proto.detail'] [data-role='todo-proto.jnote'] {
+		padding: 0;
+	}
+
+	& [data-role='todo-proto.jmeta'] {
+		font-size: 12px;
+		color: var(--tp-mute);
+	}
+
+	& [data-role='todo-proto.jtitle'] {
+		flex: 1 1 0;
+		min-width: 0;
+		font-size: 18px;
+		font-weight: 600;
+		line-height: 1.35;
+		color: var(--tp-ink);
+		overflow-wrap: anywhere;
+	}
+
+	& [data-role='todo-proto.jfacts'],
+	& [data-role='todo-proto.jhelp'] {
+		font-size: 13px;
+		line-height: 1.5;
+		color: var(--tp-mute);
+	}
+
+	& [data-role='todo-proto.jdesc'] {
+		max-height: 40vh;
+		overflow-y: auto;
+		font-size: 14px;
+		line-height: 1.5;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		color: var(--tp-soft);
+	}
+
+	& [data-role='todo-proto.jdesc'][data-empty='true'] {
+		color: var(--tp-faint);
+	}
+
+	& [data-role='todo-proto.jlabel'] {
+		margin-bottom: -8px;
+		font-size: 12px;
+		font-weight: 500;
+		color: var(--tp-mute);
+	}
+
+	& [data-role='todo-proto.jfield'],
+	& [data-role='todo-proto.jira-token'] {
+		height: auto;
+		padding: 9px 12px;
+		border: 1px solid var(--tp-line);
+		border-radius: 10px;
+		background: var(--tp-card);
+		box-shadow: none;
+		font-size: 14px;
+		color: var(--tp-ink);
+	}
+
+	& [data-role='todo-proto.jfield'].focused,
+	& [data-role='todo-proto.jira-token'].focused {
+		border-color: rgb(from var(--accent) r g b / 60%);
+		background: var(--tp-card);
+		box-shadow: none;
+	}
+
+	& [data-role='todo-proto.jfield'] .sf-ed-ph,
+	& [data-role='todo-proto.jira-token'] .sf-ed-ph {
+		color: var(--tp-faint);
+	}
+
+	/* Only the field being typed in shows a caret. */
+	& [data-role='todo-proto.jfield']:not(.focused) .sf-caret,
+	& [data-role='todo-proto.jira-token']:not(.focused) .sf-caret {
+		display: none;
+	}
+
+	& [data-role='todo-proto.jbuttons'] {
+		display: flex;
+		flex-direction: row;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 10px;
+		margin-top: 8px;
+	}
 }
 
 [data-theme='light'] .sf-main[data-surface='plugin.todo-proto.list'] {
