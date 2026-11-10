@@ -32,6 +32,11 @@
 -- linked by `jira.key` and launches it like Enter on a task), a adds it without starting, o
 -- opens it in Jira, r reloads, p picks the project, b the board, c edits the connection. A
 -- linked task that turns done moves its issue to a done status in Jira (see `rewrite`).
+--
+-- Task card → Jira: while Jira is connected, an unlinked open task's card has Project and
+-- Component rows and Post to Jira (Add and post to Jira on a new task), which creates the issue
+-- and links the task to it. Nothing stored preselects the Tickets tab's project (else Jira's
+-- first) and the project's first component; a pick or a post stores them (jira.target).
 
 local ui = tern.ui
 local session = require("./session")
@@ -39,10 +44,11 @@ local json = require("./json")
 require("./session-import")
 local auto_import = require("./auto-import")
 local session_files = require("./session-files")
--- The Tickets tab's functions and constants live in this one table: the chunk is close to
--- Luau's limit of 200 locals.
+-- The Tickets tab's functions and constants live in this one table, and the task card's in
+-- `card`: the chunk is at Luau's limit of 200 locals.
 local jira = {}
 jira.link = require("./jira-link")
+local card = {}
 
 local POLL_MS = 5 * 1000
 -- fswatch reports a file change within about WATCH_LATENCY_S; POLL_MS stays as the fallback when it is missing or misses an event.
@@ -114,6 +120,8 @@ local SEARCH: { [string]: string } = {
 	chat = "Search chats",
 	jira_project = "Search projects",
 	jira_board = "Search boards",
+	jira_target = "Search projects",
+	jira_component = "Search components",
 }
 
 -- Settings (tern.kv "settings", shared by every Todos block and window; absent keys use
@@ -185,11 +193,12 @@ type Ticket = {
 }
 type JiraProject = { key: string, name: string }
 type JiraBoard = { id: number, name: string, kind: string? }
+type JiraComponent = { id: string, name: string }
 type Sprint = { id: number, name: string, ends: string? }
 -- What the Tickets tab knows. `conn` is "unknown" until the window first answers, then
--- "connected" or "disconnected". `busy` and `last` are keyed by request slot: the op, or
--- "done:<key>" per issue; `last` holds the newest request number, so older answers and the
--- copies a second window sends are dropped.
+-- "connected" or "disconnected". `busy` and `last` are keyed by request slot: the op,
+-- "done:<key>" per issue or "create:<task id>" per task; `last` holds the newest request
+-- number, so older answers and the copies a second window sends are dropped.
 type Jira = {
 	conn: string,
 	url: string?,
@@ -214,6 +223,12 @@ type Jira = {
 	editing: boolean,
 	-- A project was just picked: open the board picker once its boards arrive (several).
 	want_board: boolean,
+	-- Where the task card posts new issues, as the window stores it: the project, and per
+	-- project key its component (false: none). Either one unset falls back to a default (see
+	-- jira.target). `comps` holds each project's components once loaded, `comps_error` why not.
+	post: { project: JiraProject?, components: { [string]: JiraComponent | boolean } },
+	comps: { [string]: { JiraComponent } },
+	comps_error: { [string]: string },
 }
 
 -- Popover state. `kind` is project, model or chat; `text` is the search
@@ -776,11 +791,16 @@ local function deep_equal(a: any, b: any): boolean
 	return true
 end
 
+-- The request slot of an op (see Jira.busy): one per issue for done, per task for create.
+function jira.slot(op: string, key: string?, task: string?): string
+	return if op == "done" and key then "done:" .. key elseif op == "create" and task then "create:" .. task else op
+end
+
 -- Asks the window's Jira half (jira.luau) for `op`; the answer arrives as a "todo.jira" event
 -- (jira.answer). A request left unanswered for WAIT_MS is given up.
 function jira.ask(state: State, op: string, query: { [string]: string }?)
 	local j = state.jira
-	local slot = if op == "done" and query and query.key then "done:" .. query.key else op
+	local slot = jira.slot(op, query and query.key, query and query.task)
 	j.req += 1
 	local req = j.req
 	-- `pane` lets the window answer this block even while its tab is hidden (the link's own
@@ -811,6 +831,10 @@ function jira.ask(state: State, op: string, query: { [string]: string }?)
 			j.form_error = message
 		elseif op == "done" then
 			state.cx:toast("error", "Could not close " .. tostring(query and query.key) .. " in Jira", message)
+		elseif op == "create" then
+			state.cx:toast("error", "Could not post the task to Jira", message)
+		elseif op == "components" then
+			j.comps_error[tostring(query and query.project)] = message
 		else
 			j.error = message
 		end
@@ -945,7 +969,9 @@ local function last_project(): string?
 	return if ok then str_or_nil(v) else nil
 end
 
-local function add_task(state: State, title: string)
+-- Adds the task (the draft's priority, agent, links and notes) as the first one and selects
+-- it. Returns its id, or nil when the file could not be written.
+local function add_task(state: State, title: string): string?
 	local new_id = ""
 	local draft = state.fresh
 	local cwd = if draft then draft.links.cwd else last_project()
@@ -964,7 +990,7 @@ local function add_task(state: State, title: string)
 		table.insert(list, 1, {
 			id = new_id,
 			title = title,
-			notes = "",
+			notes = if draft then draft.notes else "",
 			priority = if draft then draft.priority else "none",
 			agent = if draft then draft.agent else nil,
 			due = tern.json.null,
@@ -973,13 +999,15 @@ local function add_task(state: State, title: string)
 			links = if draft then table.clone(draft.links) else (if cwd then { cwd = cwd } else {}),
 		})
 	end)
-	if written then
-		state.fresh = nil
-		state.cursor = new_id
-		state.sel = {}
-		state.anchor = nil
-		state.detail_open = true
+	if not written then
+		return nil
 	end
+	state.fresh = nil
+	state.cursor = new_id
+	state.sel = {}
+	state.anchor = nil
+	state.detail_open = true
+	return new_id
 end
 
 local function index_of(state: State): number
@@ -3090,6 +3118,18 @@ local function save_field(state: State, f: Field, name: string, mode: string)
 	end
 	local draft = if name == "title" then trim(f.text) else f.text
 	local cancel = mode == "cancel" or (name == "title" and mode == "commit" and draft == "")
+	-- A new task's notes stay on the draft until add_task writes it (its title is the add row).
+	local fresh = state.fresh
+	if fresh and fresh.id == id then
+		if name == "notes" then
+			if cancel then
+				reset_field(f, f.base)
+				f.task = id
+			end
+			fresh.notes = f.text
+		end
+		return
+	end
 	rewrite(state, function(list)
 		for _, item in list do
 			if type(item) ~= "table" or item.id ~= id then
@@ -3140,15 +3180,18 @@ function jira.field(state: State, name: string?): Field?
 end
 
 local function set_focus(state: State, field: string?)
-	if state.focus == "add" and state.fresh and field ~= "add" and field ~= "picker" then
-		drop_fresh(state)
-	end
+	-- A new task lives while its add row, its notes or a popover has focus.
+	local drop = state.fresh ~= nil and field ~= "add" and field ~= "notes" and field ~= "picker"
+		and (state.focus == "add" or state.focus == "notes" or state.focus == "picker")
 	if state.focus == "title" and field ~= "title" then
 		save_field(state, state.title, "title", "commit")
 		state.title.task = nil
 	elseif state.focus == "notes" and field ~= "notes" then
 		save_field(state, state.notes, "notes", "commit")
 		state.notes.task = nil
+	end
+	if drop then
+		drop_fresh(state)
 	end
 	local t = selected(state)
 	if field == "notes" then
@@ -3205,6 +3248,19 @@ local function sync_fresh_title(state: State)
 	if state.fresh then
 		state.fresh.title = trim(state.add.text)
 	end
+end
+
+-- Adds the task the add row holds (Enter there, or the new task card's buttons). Returns its
+-- id; nil while the title is empty or when the file could not be written.
+function card.add(state: State): string?
+	local title = trim(state.add.text)
+	if title == "" then
+		return nil
+	end
+	local id = add_task(state, title)
+	reset_field(state.add, "")
+	set_focus(state, nil)
+	return id
 end
 
 local function begin_rename(state: State)
@@ -3271,6 +3327,9 @@ function jira.new(): Jira
 		cursor = nil,
 		editing = false,
 		want_board = false,
+		post = { project = nil, components = {} },
+		comps = {},
+		comps_error = {},
 	}
 end
 
@@ -3278,8 +3337,26 @@ end
 function jira.apply_status(state: State, s: any)
 	local j = state.jira
 	j.conn = if s.connected == true then "connected" else "disconnected"
+	if str_or_nil(s.url) ~= j.url then
+		j.comps, j.comps_error = {}, {}
+	end
 	j.url, j.email, j.user = str_or_nil(s.url), str_or_nil(s.email), str_or_nil(s.user)
-	local p, b = s.project, s.board
+	local p, b, post = s.project, s.board, s.post
+	local target: { project: JiraProject?, components: { [string]: JiraComponent | boolean } } = { project = nil, components = {} }
+	if type(post) == "table" then
+		local pp = post.project
+		if type(pp) == "table" and str_or_nil(pp.key) then
+			target.project = { key = pp.key, name = str_or_nil(pp.name) or pp.key }
+		end
+		for key, v in (if type(post.components) == "table" then post.components else {}) :: { [any]: any } do
+			if type(key) == "string" and v == false then
+				target.components[key] = false
+			elseif type(key) == "string" and type(v) == "table" and str_or_nil(v.id) then
+				target.components[key] = { id = v.id, name = str_or_nil(v.name) or v.id }
+			end
+		end
+	end
+	j.post = target
 	local project: JiraProject? = if type(p) == "table" and str_or_nil(p.key)
 		then { key = p.key, name = str_or_nil(p.name) or p.key }
 		else nil
@@ -3497,6 +3574,170 @@ function jira.open_issue(state: State, key: string)
 	end
 end
 
+-- Task card → Jira ----------------------------------------------------------------
+
+-- Notes sent as an issue's description, at most (bytes).
+jira.DESCRIPTION_MAX = 30000
+-- Popover kinds of the Jira half; they need no task.
+jira.KINDS = { jira_project = true, jira_board = true, jira_target = true, jira_component = true } :: { [string]: boolean }
+
+-- `s` cut to at most `max` bytes at a UTF-8 character boundary.
+function jira.clip(s: string, max: number): string
+	if #s <= max then
+		return s
+	end
+	local cut = max
+	while cut > 0 and bit32.band(string.byte(s, cut + 1) or 0, 0xC0) == 0x80 do
+		cut -= 1
+	end
+	return string.sub(s, 1, cut)
+end
+
+-- Where the task card posts: the stored project, else the Tickets tab's, else the first one
+-- Jira lists; with the project's stored component (false: none), else its first one. `ready`
+-- is false until the components that decide it have loaded (or failed to).
+function jira.target(state: State): (JiraProject?, JiraComponent?, boolean)
+	local j = state.jira
+	local p = j.post.project or j.project or (if j.projects then j.projects[1] else nil)
+	if not p then
+		return nil, nil, false
+	end
+	local list = j.comps[p.key]
+	local stored = j.post.components[p.key]
+	if stored == false then
+		return p, nil, true
+	end
+	if type(stored) == "table" then
+		if not list then
+			return p, stored, true
+		end
+		-- One deleted in Jira since falls back to the default.
+		for _, c in list do
+			if c.id == stored.id then
+				return p, c, true
+			end
+		end
+	end
+	if list then
+		return p, list[1], true
+	end
+	return p, nil, j.comps_error[p.key] ~= nil
+end
+
+-- Asks for what jira.target still lacks: the project list, or the target's components. A
+-- failed list is not asked again; opening its popover retries.
+function jira.prefetch(state: State)
+	local j = state.jira
+	if j.conn ~= "connected" then
+		return
+	end
+	local p = j.post.project or j.project or (if j.projects then j.projects[1] else nil)
+	if not p then
+		if not j.projects and not j.busy.projects and not j.list_error then
+			jira.ask(state, "projects", nil)
+		end
+	elseif j.comps[p.key] == nil and j.comps_error[p.key] == nil and not j.busy.components then
+		jira.ask(state, "components", { project = p.key })
+	end
+end
+
+-- The project or component picked in the task card's popovers becomes the stored target.
+-- `component` is a component id, false for none, or nil to keep the project's stored one.
+function jira.choose_target(state: State, p: JiraProject, component: (string | boolean)?)
+	local j = state.jira
+	j.post.project = p
+	local q: { [string]: string } = { project = p.key, project_name = p.name }
+	if component == false then
+		j.post.components[p.key] = false
+		q.component = "none"
+	elseif type(component) == "string" then
+		for _, c in j.comps[p.key] or {} do
+			if c.id == component then
+				j.post.components[p.key] = c
+				q.component, q.component_name = c.id, c.name
+			end
+		end
+	end
+	jira.ask(state, "target", q)
+	jira.prefetch(state)
+end
+
+-- Post to Jira: an issue from the task (title, notes) in the target project and component,
+-- which the window then stores as the target; its answer links the task (jira.answer).
+function jira.post(state: State, t: Todo)
+	local j = state.jira
+	if t.jira or t.id == "" or j.busy["create:" .. t.id] or j.conn ~= "connected" then
+		return
+	end
+	local p, comp, ready = jira.target(state)
+	if not p or not ready then
+		jira.prefetch(state)
+		state.cx:toast("info", if p then "Loading the components of " .. p.name else "Loading the Jira projects", "Post again in a moment.")
+		return
+	end
+	local title = trim(t.title)
+	if title == "" then
+		state.cx:toast("warning", "Give the task a title first")
+		return
+	end
+	jira.ask(state, "create", {
+		task = t.id,
+		project = p.key,
+		project_name = p.name,
+		component = if comp then comp.id else "",
+		component_name = if comp then comp.name else "",
+		summary = title,
+		description = jira.clip(trim(t.notes), jira.DESCRIPTION_MAX),
+	})
+end
+
+-- The answer to create: the new issue's link goes on the task it was made from.
+function jira.posted(state: State, data: any, err: string?)
+	local j = state.jira
+	local task, key = str_or_nil(data.task), str_or_nil(data.key)
+	if err or not task or not key then
+		state.cx:toast("error", "Could not post the task to Jira", err or "Jira did not say which issue it created.")
+		return
+	end
+	local url = str_or_nil(data.url) or (if j.url then j.url .. "/browse/" .. key else nil)
+	local linked = false
+	rewrite(state, function(list)
+		for _, item in list do
+			if type(item) == "table" and item.id == task then
+				item.jira = { key = key, url = url }
+				linked = true
+				return true
+			end
+		end
+		return false
+	end)
+	-- What the window used: the project, the component (if any) and the issue type.
+	local where: { string } = {}
+	for _, part in { data.project_name, data.component_name, data.kind } do
+		if str_or_nil(part) then
+			table.insert(where, part)
+		end
+	end
+	if linked then
+		state.cx:toast("success", "Posted to Jira as " .. key, table.concat(where, " · "))
+	else
+		state.cx:toast("warning", "Created " .. key .. " in Jira", "Its task is no longer in the file.")
+	end
+	if str_or_nil(data.warning) then
+		state.cx:toast("warning", data.warning)
+	end
+end
+
+-- Opens a linked task's issue: its stored link, else the connected site's.
+function jira.open_task_issue(state: State, t: Todo)
+	local link = t.jira
+	if link and link.url then
+		state.cx:open(link.url)
+	elseif link then
+		jira.open_issue(state, link.key)
+	end
+end
+
 -- Connect / Save (or Enter in the form): the window checks and stores the connection; an empty
 -- token field keeps the stored token.
 function jira.connect(state: State)
@@ -3539,7 +3780,7 @@ function jira.answer(state: State, data: any)
 	local j = state.jira
 	local op: string = data.op
 	local key = str_or_nil(data.key)
-	local slot = if op == "done" and key then "done:" .. key else op
+	local slot = jira.slot(op, key, str_or_nil(data.task))
 	if j.last[slot] == nil or tonumber(data.req) ~= j.last[slot] then
 		return
 	end
@@ -3549,6 +3790,14 @@ function jira.answer(state: State, data: any)
 	if type(data.status) == "table" then
 		jira.apply_status(state, data.status)
 	end
+	jira.handle(state, op, data, err, key)
+	-- Whatever changed, the task card's target may now lack its projects or components.
+	jira.prefetch(state)
+end
+
+-- What an answer does, by op (see jira.answer).
+function jira.handle(state: State, op: string, data: any, err: string?, key: string?)
+	local j = state.jira
 	if op == "connect" then
 		if err then
 			j.form_error = err
@@ -3567,7 +3816,10 @@ function jira.answer(state: State, data: any)
 		state.cx:toast("info", "Disconnected from Jira", "The token is removed from the keychain")
 	elseif op == "status" then
 		j.error = err
-		jira.load(state, false)
+		-- Blocks ask at start too; the sprint loads once the Tickets tab shows.
+		if state.tab == "tickets" then
+			jira.load(state, false)
+		end
 	elseif op == "select" then
 		if err then
 			j.error = err
@@ -3653,6 +3905,28 @@ function jira.answer(state: State, data: any)
 		else
 			state.cx:toast("success", "Closed " .. key .. " in Jira", "Status: " .. status)
 		end
+	elseif op == "components" then
+		local project = str_or_nil(data.project)
+		if not project then
+			return
+		end
+		if err or type(data.components) ~= "table" then
+			j.comps_error[project] = err or "Jira sent no components."
+		else
+			local list: { JiraComponent } = {}
+			for _, c in data.components do
+				if type(c) == "table" and str_or_nil(c.id) and str_or_nil(c.name) then
+					table.insert(list, { id = c.id, name = c.name })
+				end
+			end
+			j.comps[project], j.comps_error[project] = list, nil
+		end
+	elseif op == "target" then
+		if err then
+			state.cx:toast("error", "Could not save the Jira project", err)
+		end
+	elseif op == "create" then
+		jira.posted(state, data, err)
 	end
 end
 
@@ -3793,15 +4067,17 @@ local function project_items(state: State, pk: Pick, t: Todo): ({ PickItem }, st
 	return items, if #items == 0 then "No matching projects" else nil
 end
 
--- Rows of the Jira project and board popovers (Tickets tab; no task needed).
+-- Rows of the Jira popovers: the Tickets tab's project and board, and the task card's target
+-- project and component (none needs a task).
 function jira.pick_items(state: State, pk: Pick): ({ PickItem }, string?)
 	local j = state.jira
 	local filter = string.lower(pk.q.text)
 	local items: { PickItem } = {}
-	if pk.kind == "jira_project" then
+	if pk.kind == "jira_project" or pk.kind == "jira_target" then
 		if not j.projects then
 			return items, if j.busy.projects then "Loading projects…" else (j.list_error or "No projects")
 		end
+		local current = if pk.kind == "jira_target" then jira.target(state) else j.project
 		for _, p in j.projects do
 			if filter == "" or contains(p.name, filter) or contains(p.key, filter) then
 				table.insert(items, {
@@ -3809,11 +4085,30 @@ function jira.pick_items(state: State, pk: Pick): ({ PickItem }, string?)
 					path = p.key,
 					name = p.name,
 					hint = p.key,
-					current = j.project ~= nil and j.project.key == p.key,
+					current = current ~= nil and current.key == p.key,
 				})
 			end
 		end
 		return items, if #items == 0 then "No matching projects" else nil
+	end
+	if pk.kind == "jira_component" then
+		local p, comp, ready = jira.target(state)
+		if not p then
+			return items, "Pick a Jira project first"
+		end
+		if filter == "" then
+			table.insert(items, { kind = "none", name = "No component", hint = p.name, current = ready and comp == nil })
+		end
+		local list = j.comps[p.key]
+		if not list then
+			return items, if j.busy.components then "Loading components…" else (j.comps_error[p.key] or "No components")
+		end
+		for _, c in list do
+			if filter == "" or contains(c.name, filter) then
+				table.insert(items, { kind = "opt", path = c.id, name = c.name, current = comp ~= nil and comp.id == c.id })
+			end
+		end
+		return items, if #items == 0 then "No matching components" else nil
 	end
 	local boards = if j.project and j.boards_for == j.project.key then j.boards else nil
 	if not boards then
@@ -3837,7 +4132,7 @@ end
 local function picker_items(state: State): ({ PickItem }, string?)
 	local pk = state.pick
 	local items: { PickItem } = {}
-	if pk and (pk.kind == "jira_project" or pk.kind == "jira_board") then
+	if pk and jira.KINDS[pk.kind] then
 		return jira.pick_items(state, pk)
 	end
 	local t = selected(state)
@@ -3923,7 +4218,7 @@ open_settings = function(state: State)
 end
 
 open_picker = function(state: State, kind: string)
-	local is_jira = kind == "jira_project" or kind == "jira_board"
+	local is_jira = jira.KINDS[kind] == true
 	local t = selected(state)
 	if not t and not is_jira then
 		return
@@ -3947,12 +4242,19 @@ open_picker = function(state: State, kind: string)
 		load_models(state)
 	elseif kind == "chat" and t then
 		scan_chats(state, t.links.cwd)
-	elseif kind == "jira_project" and not j.busy.projects then
+	elseif (kind == "jira_project" or kind == "jira_target") and not j.busy.projects then
 		j.list_error = nil
 		jira.ask(state, "projects", nil)
 	elseif kind == "jira_board" and j.project and not j.busy.boards and j.boards_for ~= j.project.key then
 		j.list_error = nil
 		jira.ask(state, "boards", { project = j.project.key })
+	elseif kind == "jira_component" then
+		-- Asked again on every open, so components added in Jira since show up.
+		local p = jira.target(state)
+		if p and not j.busy.components then
+			j.comps_error[p.key] = nil
+			jira.ask(state, "components", { project = p.key })
+		end
 	end
 	local initial = picker_items(state)
 	for i, it in initial do
@@ -3983,6 +4285,19 @@ local function apply_pick(state: State, kind: string, value: string?)
 			if tostring(b.id) == value then
 				jira.choose_board(state, b)
 			end
+		end
+		return
+	elseif kind == "jira_target" then
+		for _, p in state.jira.projects or {} do
+			if p.key == value then
+				jira.choose_target(state, p, nil)
+			end
+		end
+		return
+	elseif kind == "jira_component" then
+		local p = jira.target(state)
+		if p then
+			jira.choose_target(state, p, value or false)
 		end
 		return
 	end
@@ -4084,12 +4399,7 @@ local function field_key(state: State, key: Key): boolean
 				reset_field(state.add, "")
 			end
 		elseif what == "submit" then
-			local title = trim(state.add.text)
-			if title ~= "" then
-				add_task(state, title)
-				reset_field(state.add, "")
-				set_focus(state, nil)
-			end
+			card.add(state)
 		elseif what == "text" then
 			sync_fresh_title(state)
 		end
@@ -4127,9 +4437,10 @@ local function field_key(state: State, key: Key): boolean
 		local name = state.focus :: string
 		save_field(state, f, name, "cancel")
 		f.task = nil
-		set_focus(state, nil)
+		-- A new task's notes hand back to its add row, where Enter adds it.
+		set_focus(state, if state.fresh then "add" else nil)
 	elseif what == "blur" or what == "submit" then
-		set_focus(state, nil)
+		set_focus(state, if state.fresh then "add" else nil)
 	elseif what == "text" then
 		field_changed(state)
 		if state.focus == "notes" and key.name == "enter" and not key.shift then
@@ -4481,6 +4792,8 @@ local PICK_TITLE: { [string]: string } = {
 	chat = "Chat",
 	jira_project = "Jira",
 	jira_board = "Board",
+	jira_target = "Jira",
+	jira_component = "Jira",
 }
 local PICK_NOUN: { [string]: string } = {
 	project = "projects",
@@ -4488,6 +4801,8 @@ local PICK_NOUN: { [string]: string } = {
 	chat = "chats",
 	jira_project = "projects",
 	jira_board = "boards",
+	jira_target = "projects",
+	jira_component = "components",
 }
 
 local function picker_node(state: State): Node?
@@ -4636,78 +4951,161 @@ local function chat_title(state: State, t: Todo): string
 	return if state.chats_loading or tried == nil then "Loading chat…" else "Unknown chat"
 end
 
-local function detail_view(state: State, t: Todo): Node
+-- A labelled row of the task card: the name in a fixed column, its controls after it.
+function card.row(key: string, label: string, kids: { Node }): Node
+	return el("div", "prop", key, nil, {
+		el("span", "plabel", "label", { text = label }),
+		el("div", "pval", "value", nil, kids),
+	})
+end
+
+-- The task card's Jira rows: the linked issue; else, while Jira is connected and the task is
+-- open, the project and component Post to Jira uses. Nil when there are none.
+function jira.card_rows(state: State, t: Todo): { Node }?
+	local j = state.jira
+	local link = t.jira
+	if link then
+		return {
+			card.row("issue", "Issue", {
+				el("button", "pillbtn", "issue", {
+					text = link.key,
+					title = "Open " .. link.key .. " in Jira",
+					attrs = { ["data-icon"] = "issue", ["data-chev"] = "ext", ["data-open"] = "false" },
+					actions = { click = "jissue" },
+				}),
+			}),
+		}
+	end
+	if j.conn ~= "connected" or t.done then
+		return nil
+	end
+	local p, comp, ready = jira.target(state)
+	local project = if p then p.name elseif j.busy.projects then "Loading…" else "Pick a project"
+	local component = if comp then comp.name elseif p and not ready then "Loading…" else "No component"
+	return {
+		card.row("jproject", "Project", { pill_box(state, "jira_target", "jtarget", project, if p then nil else "muted", nil) }),
+		card.row("jcomp", "Component", { pill_box(state, "jira_component", "jcomp", component, if comp then nil else "muted", nil) }),
+	}
+end
+
+-- The text of the card's Post to Jira button; nil when the task cannot be posted.
+function jira.post_label(state: State, t: Todo): string?
+	local j = state.jira
+	if t.jira or t.done or j.conn ~= "connected" then
+		return nil
+	end
+	if t.id ~= "" and j.busy["create:" .. t.id] then
+		return "Posting…"
+	end
+	return if state.fresh == t then "Add and post to Jira" else "Post to Jira"
+end
+
+-- The task card: title, status, notes; then labelled rows for the task, the agent that runs
+-- it and its Jira issue; then the actions. A new task (the draft) mirrors the add row's text
+-- as its title and has no order buttons.
+function card.view(state: State, t: Todo): Node
+	local draft = state.fresh == t
 	local notes = field_node("editor", {
 		key = "notes",
 		role = ROLE .. "notes",
 		placeholder = "Add notes",
 	}, if state.focus == "notes" then state.notes else nil, t.notes)
-	local auto_on = if t.auto_title == nil then state.cfg.omp_titles == true else t.auto_title
-	local icon_nodes: { Node } = {
-		click_pill("prio", PRIORITY_LABEL[t.priority], PILL_TONE[t.priority], "prio-" .. t.priority, "prio"),
-		el("button", "hbtn", "up", {
+	local head_kids: { Node } = {}
+	if draft then
+		table.insert(head_kids, el("div", "detail-title", "title", {
+			text = if t.title ~= "" then t.title else "New task",
+			attrs = { ["data-empty"] = if t.title == "" then "true" else "false" },
+		}))
+	else
+		table.insert(head_kids, field_node("editor", {
+			key = "title",
+			role = ROLE .. "detail-title",
+			aria = "Task title",
+		}, if state.focus == "title" then state.title else nil, t.title))
+		table.insert(head_kids, el("button", "hbtn", "up", {
 			aria = "Move up",
 			title = "Move up (Alt+↑)",
 			attrs = { ["data-kind"] = "up", ["data-edge"] = if can_move(state, t, -1) then "false" else "true" },
 			actions = { click = "mv=up" },
-		}),
-		el("button", "hbtn", "down", {
+		}))
+		table.insert(head_kids, el("button", "hbtn", "down", {
 			aria = "Move down",
 			title = "Move down (Alt+↓)",
 			attrs = { ["data-kind"] = "down", ["data-edge"] = if can_move(state, t, 1) then "false" else "true" },
 			actions = { click = "mv=down" },
-		}),
-	}
-	if t.links.omp_session then
-		table.insert(icon_nodes, 1, click_pill("autotitle", if auto_on then "Auto title: on" else "Auto title: off", if auto_on then "success" else nil, "none", "autotitle"))
+		}))
 	end
-	local icons = el("div", "icons", "icons", nil, icon_nodes)
-	local agent = el("div", "agent", "agent", nil, {
-		el("div", "agent-title", "title", { text = "Hand it to an agent" }),
-		el("div", "agent-row", "pills", nil, {
-			pill_box(state, "model", "model", t.agent.model or "Default model", nil, nil),
-			level_pill(t.agent.thinking),
-			el("div", "agent-group", "project", nil, {
-				pill_box(state, "project", "cwd", if t.links.cwd then project_label(state, t.links.cwd) else "No project", nil, "folder"),
-				click_pill("worktree", if state.cfg.new_chat_worktree then "Worktree" else "Local", nil, "none", "worktree"),
-			}),
-			pill_box(state, "chat", "chat", chat_title(state, t), nil, nil),
-		}),
-	})
-	local buttons = el("div", "buttons", "buttons", nil, if state.fresh then {} else {
-		el("button", "pill", "open", { text = primary_label(t), actions = { click = "primary" } }),
-		el("button", "pill", "done", {
-			text = if t.done then "Mark as not done" else "Mark as done",
-			actions = { click = "toggle=" .. t.id },
-		}),
-	})
+	table.insert(head_kids, el("button", "close", "close", { aria = "Close", title = "Close", actions = { click = "close" } }))
+	local kids: { Node } = { el("div", "detail-head", "head", nil, head_kids) }
 	local kind = status_of(state, t, live_panes())
-	local head: { Node } = {
-		el("div", "detail-head", "head", nil, {
-			field_node("editor", {
-				key = "title",
-				role = ROLE .. "detail-title",
-				aria = "Task title",
-			}, if state.focus == "title" then state.title else nil, t.title),
-			el("button", "close", "close", { aria = "Close", title = "Close", actions = { click = "close" } }),
-		}),
-	}
 	if STATUS_LABEL[kind] then
-		table.insert(head, el("div", "chiprow", "chiprow", nil, {
+		table.insert(kids, el("div", "chiprow", "chiprow", nil, {
 			el("span", "statuschip", "chip", { text = STATUS_LABEL[kind], attrs = { ["data-kind"] = kind } }),
 		}))
 	end
 	local _, _, sentence = stamp_label(state, t)
 	if state.cfg.time and sentence then
-		table.insert(head, el("div", "stampline", "stamp", { text = sentence }))
+		table.insert(kids, el("div", "stampline", "stamp", { text = sentence }))
 	end
-	table.insert(head, notes)
-	table.insert(head, icons)
-	table.insert(head, agent)
-	table.insert(head, buttons)
+	table.insert(kids, notes)
+	local task_rows: { Node } = {
+		card.row("prio", "Priority", {
+			click_pill("prio", PRIORITY_LABEL[t.priority], PILL_TONE[t.priority], "prio-" .. t.priority, "prio"),
+		}),
+	}
+	if t.links.omp_session then
+		local auto_on = if t.auto_title == nil then state.cfg.omp_titles == true else t.auto_title
+		table.insert(task_rows, card.row("autotitle", "Auto title", {
+			click_pill("autotitle", if auto_on then "On" else "Off", if auto_on then "success" else nil, "none", "autotitle"),
+		}))
+	end
+	table.insert(kids, el("div", "dsec", "task", nil, task_rows))
+	table.insert(kids, el("div", "dsec", "agent", nil, {
+		el("div", "dsec-title", "title", { text = "Agent" }),
+		card.row("model", "Model", { pill_box(state, "model", "model", t.agent.model or "Default model", nil, nil) }),
+		card.row("level", "Thinking", { level_pill(t.agent.thinking) }),
+		card.row("project", "Project", {
+			pill_box(state, "project", "cwd", if t.links.cwd then project_label(state, t.links.cwd) else "No project", nil, "folder"),
+			click_pill("worktree", if state.cfg.new_chat_worktree then "Worktree" else "Local", nil, "none", "worktree"),
+		}),
+		card.row("chat", "Chat", { pill_box(state, "chat", "chat", chat_title(state, t), nil, nil) }),
+	}))
+	local jira_rows = jira.card_rows(state, t)
+	if jira_rows then
+		table.insert(jira_rows, 1, el("div", "dsec-title", "title", { text = "Jira" }))
+		table.insert(kids, el("div", "dsec", "jira", nil, jira_rows))
+	end
+	local actions: { Node } = {}
+	local post = jira.post_label(state, t)
+	if post then
+		table.insert(actions, el("button", "pill", "jpost", {
+			text = post,
+			attrs = { ["data-busy"] = if post == "Posting…" then "true" else "false" },
+			actions = { click = "jpost" },
+		}))
+	end
+	if draft then
+		table.insert(actions, el("button", "pill", "add", {
+			text = "Add task",
+			title = "Add task (Enter)",
+			attrs = { ["data-primary"] = "true" },
+			actions = { click = "add" },
+		}))
+	else
+		table.insert(actions, el("button", "pill", "done", {
+			text = if t.done then "Mark as not done" else "Mark as done",
+			actions = { click = "toggle=" .. t.id },
+		}))
+		table.insert(actions, el("button", "pill", "open", {
+			text = primary_label(t),
+			attrs = { ["data-primary"] = "true" },
+			actions = { click = "primary" },
+		}))
+	end
+	table.insert(kids, el("div", "buttons", "buttons", nil, actions))
 	return el("div", "detail", "detail", {
 		attrs = { ["data-focus"] = if state.focus == "notes" then "notes" else "none" },
-	}, head)
+	}, kids)
 end
 
 -- Tickets tab ---------------------------------------------------------------
@@ -5046,6 +5444,25 @@ function jira.event(state: State, act: any, value: any): boolean
 		jira.load(state, true)
 	elseif act == "jtokenpage" then
 		state.cx:open(jira.TOKEN_PAGE)
+	elseif act == "jpost" then
+		-- The task card's Post to Jira; a new task is added first.
+		local t = selected(state)
+		if t and state.fresh == t then
+			local id = card.add(state)
+			t = if id then todo_by_id(state, id) else nil
+			if not t and trim(state.add.text) == "" then
+				state.cx:toast("warning", "Type the task's title first")
+				set_focus(state, "add")
+			end
+		end
+		if t then
+			jira.post(state, t)
+		end
+	elseif act == "jissue" then
+		local t = selected(state)
+		if t then
+			jira.open_task_issue(state, t)
+		end
 	else
 		return false
 	end
@@ -5296,6 +5713,13 @@ tern.block.define("list", {
 			poll_states(state)
 			poll_sessions(state)
 			start_tick(state)
+			-- The task card's Jira rows show once the window says Jira is connected.
+			tern.timer(1, function()
+				if alive(state) and state.jira.conn == "unknown" and not state.jira.busy.status then
+					jira.ask(state, "status", nil)
+					state.cx:render()
+				end
+			end)
 		end
 		return state
 	end,
@@ -5337,10 +5761,10 @@ tern.block.define("list", {
 			if #picked_ids >= 2 then
 				table.insert(cols, bulk_view(state, picked_ids))
 			elseif t and state.detail_open then
-				table.insert(cols, detail_view(state, t))
+				table.insert(cols, card.view(state, t))
 			end
 		end
-		local jira_pick = state.pick ~= nil and (state.pick.kind == "jira_project" or state.pick.kind == "jira_board")
+		local jira_pick = state.pick ~= nil and jira.KINDS[state.pick.kind] == true
 		local hint = el("div", "hint", "hint", {
 				text = if state.focus == "picker" and jira_pick
 					then "↑↓ choose  ·  type to search  ·  ⏎ pick  ·  Esc close"
@@ -5585,7 +6009,8 @@ tern.block.define("list", {
 		end
 		local act, value = ev.act, ev.value
 		if state.focus == "title" or state.focus == "notes" then
-			set_focus(state, nil)
+			-- A new task's notes hand back to its add row, so the card's buttons still see it.
+			set_focus(state, if state.fresh and state.focus == "notes" then "add" else nil)
 		end
 		if jira.event(state, act, value) then
 			return
@@ -5728,6 +6153,11 @@ tern.block.define("list", {
 			cycle_level(state, t)
 		elseif act == "primary" and t then
 			activate(state, t)
+		elseif act == "add" then
+			if not card.add(state) and trim(state.add.text) == "" then
+				state.cx:toast("warning", "Type the task's title first")
+				set_focus(state, "add")
+			end
 		elseif act == "pick" and type(value) == "string" then
 			if state.pick and state.pick.kind == value then
 				close_picker(state)

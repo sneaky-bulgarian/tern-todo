@@ -331,7 +331,16 @@
 		display: flex;
 		flex-direction: row;
 		align-items: flex-start;
-		gap: 12px;
+		gap: 4px;
+	}
+
+	& [data-role='todo-proto.detail-head'] [data-role='todo-proto.detail-title'] {
+		margin-right: 8px;
+	}
+
+	/* A new task's title mirrors the add row; "New task" stands in while it is empty. */
+	& [data-role='todo-proto.detail-title'][data-empty='true'] {
+		color: var(--tp-faint);
 	}
 
 	& [data-role='todo-proto.detail-title'] {
@@ -631,15 +640,6 @@
 		color: var(--tp-ink);
 	}
 
-	& [data-role='todo-proto.icons'] {
-		display: flex;
-		flex-direction: row;
-		align-items: center;
-		gap: 10px;
-		flex-wrap: wrap;
-		margin-top: 2px;
-	}
-
 	& [data-role='todo-proto.pillbtn'] {
 		display: block;
 		line-height: 1.4;
@@ -725,51 +725,113 @@
 		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1.5' y='1.5' width='13' height='13' rx='3.5' fill='%23ec5b57'/%3E%3Cpath d='M8 4.6v4M8 11v.3' stroke='%230d0f16' stroke-width='1.7' stroke-linecap='round'/%3E%3C/svg%3E");
 	}
 
-	& [data-role='todo-proto.agent'] {
+	/* The card's rows: a column of names and their controls, in groups split by a hairline. */
+	& [data-role='todo-proto.dsec'] {
 		display: flex;
 		flex-direction: column;
-		gap: 10px;
-		margin-top: 14px;
+		gap: 4px;
+		padding-top: 12px;
+		border-top: 1px solid var(--tp-line);
 	}
 
-	& [data-role='todo-proto.agent-title'] {
-		font-size: 14px;
+	& [data-role='todo-proto.dsec-title'] {
+		margin-bottom: 4px;
+		font-size: 11px;
+		font-weight: 600;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 		color: var(--tp-faint);
 	}
 
-	& [data-role='todo-proto.agent-group'] {
+	& [data-role='todo-proto.prop'] {
 		display: flex;
 		flex-direction: row;
-		flex-wrap: nowrap;
 		align-items: center;
-		gap: 8px;
-		min-width: 0;
-		max-width: 100%;
+		gap: 12px;
+		min-height: 32px;
 	}
 
-	& [data-role='todo-proto.agent-group'] [data-role='todo-proto.pillbtn'][data-icon='folder'] {
+	& [data-role='todo-proto.plabel'] {
+		flex: none;
+		width: 84px;
+		font-size: 13px;
+		color: var(--tp-mute);
+	}
+
+	& [data-role='todo-proto.pval'] {
+		flex: 1 1 0;
+		min-width: 0;
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		gap: 6px;
+	}
+
+	/* Compact pills in the rows, one height for all; a picker shrinks before the toggle after it. */
+	& [data-role='todo-proto.pval'] [data-role='todo-proto.pillbtn'] {
 		flex: 0 1 auto;
 		min-width: 0;
+		height: 30px;
+		padding-top: 0;
+		padding-bottom: 0;
+		padding-left: 12px;
+		line-height: 30px;
+		font-size: 13.5px;
 	}
 
-	& [data-role='todo-proto.agent-group'] [data-role='todo-proto.pillbtn'][data-icon='none'] {
+	& [data-role='todo-proto.pval'] [data-role='todo-proto.pillbtn'] + [data-role='todo-proto.pillbtn'] {
 		flex: none;
 	}
 
-	& [data-role='todo-proto.agent-row'] {
-		display: flex;
-		flex-direction: row;
-		align-items: center;
-		flex-wrap: wrap;
-		gap: 8px;
+	& [data-role='todo-proto.pval'] [data-role='todo-proto.pillbtn'][data-icon='folder'] {
+		padding-left: 36px;
+		background-size: 18px 18px, 16px 16px;
+		background-position: 11px 50%, calc(100% - 12px) 50%;
+	}
+
+	& [data-role='todo-proto.pval'] [data-role='todo-proto.pillbtn'][data-icon^='prio-'] {
+		padding-left: 34px;
+		background-position: 12px 50%;
+	}
+
+	/* The linked issue: its key in Jira blue, an arrow out to Jira on the right. */
+	& [data-role='todo-proto.pillbtn'][data-icon='issue'] {
+		padding-right: 32px;
+		background-color: rgb(76 154 255 / 14%);
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%234c9aff' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 4h6v6M12 4l-7.5 7.5'/%3E%3C/svg%3E");
+		background-size: 14px 14px;
+		background-position: calc(100% - 12px) 50%;
+		color: #4c9aff;
+		font-variant-numeric: tabular-nums;
+	}
+
+	& [data-role='todo-proto.pillbtn'][data-icon='issue']:hover {
+		background-color: rgb(76 154 255 / 22%);
+		color: #4c9aff;
 	}
 
 	& [data-role='todo-proto.buttons'] {
 		display: flex;
 		flex-direction: row;
+		flex-wrap: wrap;
 		justify-content: flex-end;
 		gap: 10px;
-		margin-top: 18px;
+		margin-top: 4px;
+	}
+
+	& [data-role='todo-proto.pill'][data-primary='true'] {
+		background: rgb(from var(--accent) r g b / 16%);
+		color: var(--accent);
+	}
+
+	& [data-role='todo-proto.pill'][data-primary='true']:hover {
+		background: rgb(from var(--accent) r g b / 26%);
+		color: var(--accent);
+	}
+
+	& [data-role='todo-proto.pill'][data-busy='true'] {
+		opacity: 0.6;
+		cursor: default;
 	}
 
 	& [data-role='todo-proto.level-ic'] {

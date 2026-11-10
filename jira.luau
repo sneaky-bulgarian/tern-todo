@@ -2,28 +2,38 @@
 -- Jira for the Tickets tab of Todos blocks: the window half (protocol in jira-link.luau).
 --
 -- The API token sits in the system keychain (tern.secrets "jira.token", which host halves
--- lack); the site URL, the email, the signed-in name and the chosen project and board in
--- tern.kv "jira" of this machine. With an email, requests sign in as Jira Cloud expects
--- (Basic email:token); without one the token goes as a Bearer token, which is how Jira Data
--- Center personal access tokens work. Only REST v2 and Agile 1.0 are used: both serve both.
+-- lack); the site URL, the email, the signed-in name, the chosen project and board, and where
+-- the task card posts new issues in tern.kv "jira" of this machine. With an email, requests
+-- sign in as Jira Cloud expects (Basic email:token); without one the token goes as a Bearer
+-- token, which is how Jira Data Center personal access tokens work. Only REST v2 and Agile 1.0
+-- are used: both serve both.
 
 local link = require("./jira-link")
 
 local KV_KEY = "jira"
 local SECRET = "jira.token"
+-- Issues being created, by the asking block's request ("<pane>:<req>"): every window of a
+-- window key gets the block's link, and only the first may create the issue.
+local CLAIMS_KEY = "jira.creating"
+local CLAIM_S = 600
 local BLOCK = "todo-proto.list"
 local PANE_MOD = 17592186044416
 local PAGE = 50
 local MAX_PAGES = 20
 local DESCRIPTION_MAX = 20000
 local TIMEOUT_MS = 20000
+-- Jira's limit on a summary, in characters.
+local SUMMARY_MAX = 255
 local ISSUE_FIELDS = "summary,status,assignee,issuetype,priority,description"
 -- Transition targets tried first, by the transition's or its status's name.
 local DONE_NAMES = { "done", "closed", "resolved", "complete", "completed" }
 
 type Project = { key: string, name: string }
 type Board = { id: number, name: string, kind: string? }
-type Config = { url: string?, email: string?, user: string?, project: Project?, board: Board? }
+type Component = { id: string, name: string }
+-- Where the task card posts: the project, and per project key its component (false: none).
+type Post = { project: Project?, components: { [string]: Component | boolean } }
+type Config = { url: string?, email: string?, user: string?, project: Project?, board: Board?, post: Post? }
 type Query = { [string]: string }
 type Reply = { [string]: any }
 type Done = (data: any, err: string?, cx: WindowCx?, status: number) -> ()
@@ -35,7 +45,23 @@ end
 local function read_config(): Config
 	local ok, raw = pcall(tern.kv.get, KV_KEY)
 	local c: { [string]: any } = if ok and type(raw) == "table" then raw else {}
-	local p, b = c.project, c.board
+	local p, b, post = c.project, c.board, c.post
+	local target: Post? = nil
+	if type(post) == "table" then
+		local pp = post.project
+		local components: { [string]: Component | boolean } = {}
+		for key, v in (if type(post.components) == "table" then post.components else {}) do
+			if type(key) == "string" and v == false then
+				components[key] = false
+			elseif type(key) == "string" and type(v) == "table" and str(v.id) then
+				components[key] = { id = v.id, name = str(v.name) or v.id }
+			end
+		end
+		target = {
+			project = if type(pp) == "table" and str(pp.key) then { key = pp.key, name = str(pp.name) or pp.key } else nil,
+			components = components,
+		}
+	end
 	return {
 		url = str(c.url),
 		email = str(c.email),
@@ -44,6 +70,7 @@ local function read_config(): Config
 		board = if type(b) == "table" and type(b.id) == "number"
 			then { id = b.id, name = str(b.name) or tostring(b.id), kind = str(b.kind) }
 			else nil,
+		post = target,
 	}
 end
 
@@ -80,6 +107,7 @@ local function snapshot(c: Config): Reply
 		user = c.user,
 		project = c.project,
 		board = c.board,
+		post = c.post,
 	}
 end
 
@@ -365,6 +393,75 @@ local function resolution_of(t: any): string?
 	return first
 end
 
+-- A task title as an issue summary: trimmed, at most SUMMARY_MAX characters; nil when empty.
+local function summary_of(text: string?): string?
+	local s = str(string.match(text or "", "^%s*(.-)%s*$"))
+	local n = if s then utf8.len(s) else nil
+	if s and n and n > SUMMARY_MAX then
+		s = string.sub(s, 1, (utf8.offset(s, SUMMARY_MAX) :: number) - 1) .. "…"
+	end
+	return s
+end
+
+-- The type a task's issue gets: Task when the project has it, else its first standard type
+-- (no sub-task, and nothing above the standard level, such as an epic).
+local function issue_type(list: any): Reply?
+	if type(list) ~= "table" then
+		return nil
+	end
+	local first: Reply? = nil
+	for _, t in list do
+		local id = if type(t) == "table" and (type(t.id) == "string" or type(t.id) == "number") then tostring(t.id) else nil
+		if id and t.subtask ~= true then
+			local name = str(t.name) or id
+			if string.lower(name) == "task" then
+				return { id = id, name = name }
+			end
+			local level = tonumber(t.hierarchyLevel)
+			if not first and (level == nil or level == 0) then
+				first = { id = id, name = name }
+			end
+		end
+	end
+	return first
+end
+
+-- Whether this window is the first to take the block's create request (see CLAIMS_KEY).
+local function claim(q: Query): boolean
+	if not q.req or not q.pane then
+		return true
+	end
+	local id = q.pane .. ":" .. q.req
+	local ok, raw = pcall(tern.kv.get, CLAIMS_KEY)
+	local claims: { [string]: any } = if ok and type(raw) == "table" then raw else {}
+	if claims[id] ~= nil then
+		return false
+	end
+	local now = os.time()
+	local kept: { [string]: number } = { [id] = now }
+	for k, at in claims do
+		if type(k) == "string" and type(at) == "number" and now - at < CLAIM_S then
+			kept[k] = at
+		end
+	end
+	pcall(tern.kv.set, CLAIMS_KEY, kept)
+	return true
+end
+
+-- Stores where the task card posts: the project, and its component (`component` "none" for
+-- none; nil keeps the one stored for that project). Returns an error.
+local function set_target(c: Config, key: string, name: string?, component: string?, component_name: string?): string?
+	local post: Post = c.post or { project = nil, components = {} }
+	post.project = { key = key, name = name or key }
+	if component == "none" then
+		post.components[key] = false
+	elseif component then
+		post.components[key] = { id = component, name = component_name or component }
+	end
+	c.post = post
+	return write_config(c)
+end
+
 local ops: { [string]: (cx: WindowCx, pane: number, q: Query) -> () } = {}
 
 ops.status = function(cx, pane, q)
@@ -392,9 +489,9 @@ ops.connect = function(cx, pane, q)
 			return
 		end
 		local old = read_config()
-		local c: Config = { url = url, email = str(q.email), user = nil, project = nil, board = nil }
+		local c: Config = { url = url, email = str(q.email), user = nil, project = nil, board = nil, post = nil }
 		if old.url == url then
-			c.project, c.board = old.project, old.board
+			c.project, c.board, c.post = old.project, old.board, old.post
 		end
 		local failed = call(c, secret, "GET", "/rest/api/2/myself", nil, function(me, err, after)
 			if err then
@@ -635,6 +732,122 @@ ops.done = function(cx, pane, q)
 			end)
 			if tfailed then
 				fail(after, tfailed)
+			end
+		end)
+		if failed then
+			fail(now, failed)
+		end
+	end)
+end
+
+-- The components of a project, for the task card's Component row, sorted by name.
+ops.components = function(cx, pane, q)
+	local project = str(q.project)
+	if not project then
+		answer(cx, pane, "components", q, { error = "Pick a project first." })
+		return
+	end
+	connected(cx, pane, "components", q, function(c, secret, now)
+		local path = "/rest/api/2/project/" .. link.encode(project) .. "/components"
+		local failed = call(c, secret, "GET", path, nil, function(data, err, after)
+			if err then
+				answer(after, pane, "components", q, { error = err, project = project })
+				return
+			end
+			local list: { Component } = {}
+			for _, it in (if type(data) == "table" then data else {}) :: { any } do
+				local id = if type(it) == "table" and (type(it.id) == "string" or type(it.id) == "number") then tostring(it.id) else nil
+				local name = if id then str(it.name) else nil
+				if id and name then
+					table.insert(list, { id = id, name = name })
+				end
+			end
+			table.sort(list, function(a: Component, b: Component): boolean
+				return string.lower(a.name) < string.lower(b.name)
+			end)
+			answer(after, pane, "components", q, { project = project, components = list })
+		end)
+		if failed then
+			answer(now, pane, "components", q, { error = failed, project = project })
+		end
+	end)
+end
+
+-- Stores where the task card posts: q.project (q.project_name) and q.component, a component
+-- id ("none" for none; absent keeps the project's stored one).
+ops.target = function(cx, pane, q)
+	local c = read_config()
+	local project = str(q.project)
+	local err = if project then set_target(c, project, str(q.project_name), str(q.component), str(q.component_name)) else nil
+	with_token(cx, function(_secret, _err, fresh)
+		answer(fresh, pane, "target", q, {
+			status = snapshot(c),
+			error = if err then "Cannot save the Jira settings: " .. err else nil,
+		})
+	end)
+end
+
+-- Creates an issue from the task q.task: q.summary, q.description, the project's issue type
+-- (issue_type) and the component q.component (empty: none), then stores that project and
+-- component as the task card's target.
+ops.create = function(cx, pane, q)
+	local project = str(q.project)
+	local summary = summary_of(q.summary)
+	if not project or not summary then
+		answer(cx, pane, "create", q, { task = q.task, error = if project then "The task has no title." else "Pick a Jira project first." })
+		return
+	end
+	if not claim(q) then
+		return
+	end
+	local component = str(q.component)
+	local function fail(at: WindowCx?, err: string?)
+		answer(at, pane, "create", q, { task = q.task, error = err or "Unknown error" })
+	end
+	connected(cx, pane, "create", q, function(c, secret, now)
+		local path = "/rest/api/2/project/" .. link.encode(project) .. "?expand=issueTypes"
+		local failed = call(c, secret, "GET", path, nil, function(info, err, after)
+			if err then
+				fail(after, err)
+				return
+			end
+			local kind = issue_type(if type(info) == "table" then info.issueTypes else nil)
+			if not kind then
+				fail(after, "Jira offers no issue type to create in " .. project .. ".")
+				return
+			end
+			local fields: { [string]: any } = { project = { key = project }, summary = summary, issuetype = { id = kind.id } }
+			if str(q.description) then
+				fields.description = q.description
+			end
+			if component then
+				fields.components = { { id = component } }
+			end
+			local pfailed = call(c, secret, "POST", "/rest/api/2/issue", { fields = fields }, function(made, perr, later)
+				if perr then
+					fail(later, perr)
+					return
+				end
+				local key = if type(made) == "table" then str(made.key) else nil
+				if not key then
+					fail(later, "Jira did not say which issue it created.")
+					return
+				end
+				local stored = read_config()
+				local werr = set_target(stored, project, str(q.project_name), component or "none", str(q.component_name))
+				answer(later, pane, "create", q, {
+					task = q.task,
+					key = key,
+					url = (c.url :: string) .. "/browse/" .. key,
+					kind = kind.name,
+					project_name = str(q.project_name) or project,
+					component_name = if component then str(q.component_name) or component else nil,
+					status = snapshot(stored),
+					warning = if werr then "Cannot save the Jira settings: " .. werr else nil,
+				})
+			end)
+			if pfailed then
+				fail(after, pfailed)
 			end
 		end)
 		if failed then
