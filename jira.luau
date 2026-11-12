@@ -3,10 +3,10 @@
 --
 -- The API token sits in the system keychain (tern.secrets "jira.token", which host halves
 -- lack); the site URL, the email, the signed-in name, the chosen project and board, and where
--- the task card posts new issues in tern.kv "jira" of this machine. With an email, requests
--- sign in as Jira Cloud expects (Basic email:token); without one the token goes as a Bearer
--- token, which is how Jira Data Center personal access tokens work. Only REST v2 and Agile 1.0
--- are used: both serve both.
+-- the task card posts new issues (project; per project its component and issue type) in
+-- tern.kv "jira" of this machine. With an email, requests sign in as Jira Cloud expects (Basic
+-- email:token); without one the token goes as a Bearer token, which is how Jira Data Center
+-- personal access tokens work. Only REST v2 and Agile 1.0 are used: both serve both.
 
 local link = require("./jira-link")
 
@@ -24,16 +24,38 @@ local DESCRIPTION_MAX = 20000
 local TIMEOUT_MS = 20000
 -- Jira's limit on a summary, in characters.
 local SUMMARY_MAX = 255
-local ISSUE_FIELDS = "summary,status,assignee,issuetype,priority,description"
+local ISSUE_FIELDS = "summary,status,assignee,issuetype,priority,description,environment"
+-- Long text fields a ticket brings along (Definition of Done, Acceptance criteria…): at most
+-- TEXT_FIELDS_MAX of the site's multi-line custom fields, each cut to DETAIL_MAX bytes.
+local TEXT_FIELDS_MAX = 40
+local DETAIL_MAX = 8000
+-- createmeta fields the task card fills in itself (title, notes, project, type, component)
+-- or that cannot be set when an issue is created.
+local OWN_FIELDS = {
+	summary = true,
+	description = true,
+	project = true,
+	issuetype = true,
+	components = true,
+	attachment = true,
+	issuelinks = true,
+	worklog = true,
+	parent = true,
+} :: { [string]: boolean }
 -- Transition targets tried first, by the transition's or its status's name.
 local DONE_NAMES = { "done", "closed", "resolved", "complete", "completed" }
 
 type Project = { key: string, name: string }
 type Board = { id: number, name: string, kind: string? }
 type Component = { id: string, name: string }
--- Where the task card posts: the project, and per project key its component (false: none).
-type Post = { project: Project?, components: { [string]: Component | boolean } }
-type Config = { url: string?, email: string?, user: string?, project: Project?, board: Board?, post: Post? }
+type IssueType = { id: string, name: string }
+type TextField = { id: string, name: string }
+-- Where the task card posts: the project, and per project key its component (false: none)
+-- and its issue type.
+type Post = { project: Project?, components: { [string]: Component | boolean }, types: { [string]: IssueType } }
+-- `me` is the signed-in user's Jira id (Cloud accountId, Data Center name): the Tickets tab
+-- tells your tickets by it.
+type Config = { url: string?, email: string?, user: string?, me: string?, project: Project?, board: Board?, post: Post? }
 type Query = { [string]: string }
 type Reply = { [string]: any }
 type Done = (data: any, err: string?, cx: WindowCx?, status: number) -> ()
@@ -57,15 +79,23 @@ local function read_config(): Config
 				components[key] = { id = v.id, name = str(v.name) or v.id }
 			end
 		end
+		local types: { [string]: IssueType } = {}
+		for key, v in (if type(post.types) == "table" then post.types else {}) do
+			if type(key) == "string" and type(v) == "table" and str(v.id) then
+				types[key] = { id = v.id, name = str(v.name) or v.id }
+			end
+		end
 		target = {
 			project = if type(pp) == "table" and str(pp.key) then { key = pp.key, name = str(pp.name) or pp.key } else nil,
 			components = components,
+			types = types,
 		}
 	end
 	return {
 		url = str(c.url),
 		email = str(c.email),
 		user = str(c.user),
+		me = str(c.me),
 		project = if type(p) == "table" and str(p.key) then { key = p.key, name = str(p.name) or p.key } else nil,
 		board = if type(b) == "table" and type(b.id) == "number"
 			then { id = b.id, name = str(b.name) or tostring(b.id), kind = str(b.kind) }
@@ -105,6 +135,7 @@ local function snapshot(c: Config): Reply
 		url = c.url,
 		email = c.email,
 		user = c.user,
+		me = c.me,
 		project = c.project,
 		board = c.board,
 		post = c.post,
@@ -224,8 +255,10 @@ local function call(c: Config, secret: string, method: string, path: string, bod
 	return if ok then nil else "Cannot call Jira: " .. tostring(err)
 end
 
--- Every item of a paged Jira list (`field` is "values" or "issues"), at most MAX_PAGES pages.
-local function all(c: Config, secret: string, path: string, field: string, done: Done): string?
+-- Every item of a paged Jira list, at most MAX_PAGES pages. The items sit in the first of
+-- `fields` the answer has: "values" (Agile, Data Center), "issues", or Jira Cloud's names for
+-- createmeta pages ("issueTypes", "fields").
+local function all(c: Config, secret: string, path: string, fields: { string }, done: Done): string?
 	local items: { any } = {}
 	local sep = if string.find(path, "?", 1, true) then "&" else "?"
 	local function page(start: number, n: number): string?
@@ -234,7 +267,13 @@ local function all(c: Config, secret: string, path: string, field: string, done:
 				done(nil, err, cx, status)
 				return
 			end
-			local got = if type(data) == "table" and type(data[field]) == "table" then data[field] else {}
+			local got: { any } = {}
+			for _, field in fields do
+				if type(data) == "table" and type(data[field]) == "table" then
+					got = data[field]
+					break
+				end
+			end
 			for _, it in got do
 				table.insert(items, it)
 			end
@@ -320,13 +359,23 @@ local function clip(s: string, max: number): string
 	return string.sub(s, 1, cut) .. "…"
 end
 
-local function ticket_of(issue: any, sprint: string): Reply?
+-- An issue of the sprint for the block. `details` are its long text fields (`texts`, in the
+-- site's order) that hold something, as { name, text }.
+local function ticket_of(issue: any, sprint: string, texts: { TextField }): Reply?
 	if type(issue) ~= "table" or not str(issue.key) then
 		return nil
 	end
 	local f = if type(issue.fields) == "table" then issue.fields else {}
 	local status = if type(f.status) == "table" then f.status else {}
 	local description = str(f.description)
+	local details: { Reply } = {}
+	for _, field in texts do
+		local text = str(f[field.id])
+		text = if text then str(string.match(text, "^%s*(.-)%s*$")) else nil
+		if text then
+			table.insert(details, { name = field.name, text = clip(text, DETAIL_MAX) })
+		end
+	end
 	return {
 		key = issue.key,
 		summary = str(f.summary) or issue.key,
@@ -334,10 +383,44 @@ local function ticket_of(issue: any, sprint: string): Reply?
 		category = if type(status.statusCategory) == "table" then str(status.statusCategory.key) or "new" else "new",
 		kind = if type(f.issuetype) == "table" then str(f.issuetype.name) else nil,
 		assignee = if type(f.assignee) == "table" then str(f.assignee.displayName) else nil,
+		assignee_id = if type(f.assignee) == "table" then str(f.assignee.accountId) or str(f.assignee.name) else nil,
 		priority = if type(f.priority) == "table" then str(f.priority.name) else nil,
 		description = if description then clip(description, DESCRIPTION_MAX) else nil,
+		details = details,
 		sprint = sprint,
 	}
+end
+
+-- The site's long text fields, read once per window run and site: the system Environment and
+-- the multi-line custom fields (Definition of Done, Acceptance criteria…), at most
+-- TEXT_FIELDS_MAX. Without the field list (no permission, old Jira) tickets come without them.
+local text_fields: { url: string, list: { TextField } }? = nil
+
+local function with_text_fields(c: Config, secret: string, at: WindowCx?, fn: (list: { TextField }, at: WindowCx?) -> ())
+	local known = text_fields
+	if known and known.url == c.url then
+		fn(known.list, at)
+		return
+	end
+	local failed = call(c, secret, "GET", "/rest/api/2/field", nil, function(data, err, after)
+		local list: { TextField } = { { id = "environment", name = "Environment" } }
+		if err or type(data) ~= "table" then
+			fn(list, after)
+			return
+		end
+		for _, f in data do
+			local schema = if type(f) == "table" and type(f.schema) == "table" then f.schema else nil
+			if schema and f.custom == true and schema.type == "string" and type(schema.custom) == "string"
+				and string.find(schema.custom, "textarea", 1, true) and str(f.id) and #list <= TEXT_FIELDS_MAX then
+				table.insert(list, { id = f.id, name = str(f.name) or f.id })
+			end
+		end
+		text_fields = { url = c.url :: string, list = list }
+		fn(list, after)
+	end)
+	if failed then
+		fn({}, at)
+	end
 end
 
 local function project_list(items: { any }): { Project }
@@ -405,11 +488,11 @@ end
 
 -- The type a task's issue gets: Task when the project has it, else its first standard type
 -- (no sub-task, and nothing above the standard level, such as an epic).
-local function issue_type(list: any): Reply?
+local function issue_type(list: any): IssueType?
 	if type(list) ~= "table" then
 		return nil
 	end
-	local first: Reply? = nil
+	local first: IssueType? = nil
 	for _, t in list do
 		local id = if type(t) == "table" and (type(t.id) == "string" or type(t.id) == "number") then tostring(t.id) else nil
 		if id and t.subtask ~= true then
@@ -424,6 +507,83 @@ local function issue_type(list: any): Reply?
 		end
 	end
 	return first
+end
+
+-- The issue types a task can become: every one but sub-tasks, in Jira's order.
+local function type_list(list: any): { IssueType }
+	local out: { IssueType } = {}
+	for _, t in (if type(list) == "table" then list else {}) :: { any } do
+		local id = if type(t) == "table" and (type(t.id) == "string" or type(t.id) == "number") then tostring(t.id) else nil
+		if id and t.subtask ~= true then
+			table.insert(out, { id = id, name = str(t.name) or id })
+		end
+	end
+	return out
+end
+
+-- The type asked for (`wanted`, an id) when the project still offers it, else issue_type's.
+local function pick_type(list: any, wanted: string?): IssueType?
+	if wanted then
+		for _, t in type_list(list) do
+			if t.id == wanted then
+				return t
+			end
+		end
+	end
+	return issue_type(list)
+end
+
+-- One createmeta field as the task card shows it: { id, name, required, default (Jira fills
+-- it when left empty), kind } and per kind:
+--   choice   `choices` ({ id, name }), `multi` for a list, `default_name` when Jira says it;
+--   text     `multiline` for a multi-line field; number, date, datetime, user, labels;
+--   other    a required field the card cannot fill (Jira must be told elsewhere).
+-- Nil for the fields the card owns (OWN_FIELDS) and optional ones it cannot fill.
+local function field_spec(f: any, key: string?): Reply?
+	if type(f) ~= "table" then
+		return nil
+	end
+	local id = str(f.fieldId) or str(f.key) or key
+	if not id or OWN_FIELDS[id] then
+		return nil
+	end
+	local schema = if type(f.schema) == "table" then f.schema else {}
+	local kind = str(schema.type) or ""
+	local custom = str(schema.custom) or ""
+	local spec: Reply = {
+		id = id,
+		name = str(f.name) or id,
+		required = f.required == true,
+		default = f.hasDefaultValue == true,
+	}
+	if type(f.allowedValues) == "table" then
+		local choices: { Reply } = {}
+		for _, v in f.allowedValues do
+			local vid = if type(v) == "table" and (type(v.id) == "string" or type(v.id) == "number") then tostring(v.id) else nil
+			local name = if vid then str(v.name) or str(v.value) else nil
+			if vid and name and v.disabled ~= true and v.archived ~= true then
+				table.insert(choices, { id = vid, name = name })
+			end
+		end
+		spec.kind, spec.multi, spec.choices = "choice", kind == "array", choices
+		local dv = f.defaultValue
+		local first = if type(dv) == "table" and dv[1] ~= nil then dv[1] else dv
+		if type(first) == "table" then
+			spec.default_name = str(first.name) or str(first.value)
+		end
+	elseif kind == "string" then
+		spec.kind = "text"
+		spec.multiline = string.find(custom, "textarea", 1, true) ~= nil or id == "environment"
+	elseif kind == "number" or kind == "date" or kind == "datetime" or kind == "user" then
+		spec.kind = kind
+	elseif kind == "array" and schema.items == "string" then
+		spec.kind = "labels"
+	elseif spec.required and not spec.default then
+		spec.kind = "other"
+	else
+		return nil
+	end
+	return spec
 end
 
 -- Whether this window is the first to take the block's create request (see CLAIMS_KEY).
@@ -448,15 +608,19 @@ local function claim(q: Query): boolean
 	return true
 end
 
--- Stores where the task card posts: the project, and its component (`component` "none" for
--- none; nil keeps the one stored for that project). Returns an error.
-local function set_target(c: Config, key: string, name: string?, component: string?, component_name: string?): string?
-	local post: Post = c.post or { project = nil, components = {} }
+-- Stores where the task card posts: the project, its component (`component` "none" for
+-- none; nil keeps the one stored for that project) and its issue type (nil keeps it).
+-- Returns an error.
+local function set_target(c: Config, key: string, name: string?, component: string?, component_name: string?, kind: IssueType?): string?
+	local post: Post = c.post or { project = nil, components = {}, types = {} }
 	post.project = { key = key, name = name or key }
 	if component == "none" then
 		post.components[key] = false
 	elseif component then
 		post.components[key] = { id = component, name = component_name or component }
+	end
+	if kind then
+		post.types[key] = kind
 	end
 	c.post = post
 	return write_config(c)
@@ -489,7 +653,7 @@ ops.connect = function(cx, pane, q)
 			return
 		end
 		local old = read_config()
-		local c: Config = { url = url, email = str(q.email), user = nil, project = nil, board = nil, post = nil }
+		local c: Config = { url = url, email = str(q.email), user = nil, me = nil, project = nil, board = nil, post = nil }
 		if old.url == url then
 			c.project, c.board, c.post = old.project, old.board, old.post
 		end
@@ -499,6 +663,7 @@ ops.connect = function(cx, pane, q)
 				return
 			end
 			c.user = str(me.displayName) or str(me.emailAddress) or str(me.name) or c.email
+			c.me = str(me.accountId) or str(me.name)
 			local function finish(final: WindowCx?)
 				local werr = write_config(c)
 				if werr then
@@ -556,7 +721,7 @@ ops.projects = function(cx, pane, q)
 				answer(after, pane, "projects", q, { error = failed })
 			end
 		end
-		local failed = all(c, secret, "/rest/api/2/project/search?orderBy=name", "values", function(items, err, after, status)
+		local failed = all(c, secret, "/rest/api/2/project/search?orderBy=name", { "values" }, function(items, err, after, status)
 			if items then
 				answer(after, pane, "projects", q, { projects = project_list(items) })
 			elseif status == 404 then
@@ -579,7 +744,7 @@ ops.boards = function(cx, pane, q)
 	end
 	connected(cx, pane, "boards", q, function(c, secret, now)
 		local path = "/rest/agile/1.0/board?projectKeyOrId=" .. link.encode(project)
-		local failed = all(c, secret, path, "values", function(items, err, after)
+		local failed = all(c, secret, path, { "values" }, function(items, err, after)
 			if not items then
 				answer(after, pane, "boards", q, { error = err, project = project })
 				return
@@ -621,7 +786,29 @@ ops.select = function(cx, pane, q)
 	end)
 end
 
--- The active sprints of the board (q.board, else the stored one) and every issue in them.
+-- Runs `fn` once `c.me` is known: a connection made before it was stored asks /myself once
+-- and keeps the answer. Without it, `fn` still runs (the block then goes by display name).
+local function with_identity(c: Config, secret: string, at: WindowCx?, fn: (at: WindowCx?) -> ())
+	if c.me then
+		fn(at)
+		return
+	end
+	local failed = call(c, secret, "GET", "/rest/api/2/myself", nil, function(me, err, after)
+		c.me = if not err and type(me) == "table" then str(me.accountId) or str(me.name) else nil
+		local stored = read_config()
+		if c.me and stored.url == c.url then
+			stored.me = c.me
+			write_config(stored)
+		end
+		fn(after)
+	end)
+	if failed then
+		fn(at)
+	end
+end
+
+-- The active sprints of the board (q.board, else the stored one) and every issue in them,
+-- with the site's long text fields (with_text_fields) and who you are (`me`).
 ops.sprint = function(cx, pane, q)
 	connected(cx, pane, "sprint", q, function(c, secret, now)
 		local board = tonumber(q.board) or (if c.board then c.board.id else nil)
@@ -629,47 +816,58 @@ ops.sprint = function(cx, pane, q)
 			answer(now, pane, "sprint", q, { error = "Pick a board first." })
 			return
 		end
-		local failed = all(c, secret, "/rest/agile/1.0/board/" .. board .. "/sprint?state=active", "values", function(found, err, after)
-			if not found then
-				answer(after, pane, "sprint", q, { error = err, board = board })
-				return
-			end
-			local sprints: { Reply } = {}
-			for _, s in found do
-				if type(s) == "table" and type(s.id) == "number" then
-					table.insert(sprints, { id = s.id, name = str(s.name) or ("Sprint " .. s.id), ends = str(s.endDate) })
+		local function fetch(texts: { TextField }, at: WindowCx?)
+			local wanted = ISSUE_FIELDS
+			for _, f in texts do
+				if f.id ~= "environment" then
+					wanted ..= "," .. f.id
 				end
 			end
-			local tickets: { Reply } = {}
-			local function load(i: number, at: WindowCx?)
-				local s = sprints[i]
-				if not s then
-					answer(at, pane, "sprint", q, { board = board, sprints = sprints, tickets = tickets })
+			local failed = all(c, secret, "/rest/agile/1.0/board/" .. board .. "/sprint?state=active", { "values" }, function(found, err, after)
+				if not found then
+					answer(after, pane, "sprint", q, { error = err, board = board })
 					return
 				end
-				local path = "/rest/agile/1.0/sprint/" .. s.id .. "/issue?fields=" .. ISSUE_FIELDS
-				local sfailed = all(c, secret, path, "issues", function(issues, ierr, later)
-					if not issues then
-						answer(later, pane, "sprint", q, { error = ierr, board = board })
+				local sprints: { Reply } = {}
+				for _, s in found do
+					if type(s) == "table" and type(s.id) == "number" then
+						table.insert(sprints, { id = s.id, name = str(s.name) or ("Sprint " .. s.id), ends = str(s.endDate) })
+					end
+				end
+				local tickets: { Reply } = {}
+				local function load(i: number, later: WindowCx?)
+					local s = sprints[i]
+					if not s then
+						answer(later, pane, "sprint", q, { board = board, sprints = sprints, tickets = tickets, me = c.me })
 						return
 					end
-					for _, issue in issues do
-						local t = ticket_of(issue, s.name)
-						if t then
-							table.insert(tickets, t)
+					local path = "/rest/agile/1.0/sprint/" .. s.id .. "/issue?fields=" .. wanted
+					local sfailed = all(c, secret, path, { "issues" }, function(issues, ierr, last)
+						if not issues then
+							answer(last, pane, "sprint", q, { error = ierr, board = board })
+							return
 						end
+						for _, issue in issues do
+							local t = ticket_of(issue, s.name, texts)
+							if t then
+								table.insert(tickets, t)
+							end
+						end
+						load(i + 1, last)
+					end)
+					if sfailed then
+						answer(later, pane, "sprint", q, { error = sfailed, board = board })
 					end
-					load(i + 1, later)
-				end)
-				if sfailed then
-					answer(at, pane, "sprint", q, { error = sfailed, board = board })
 				end
+				load(1, after)
+			end)
+			if failed then
+				answer(at, pane, "sprint", q, { error = failed, board = board })
 			end
-			load(1, after)
-		end)
-		if failed then
-			answer(now, pane, "sprint", q, { error = failed, board = board })
 		end
+		with_identity(c, secret, now, function(known)
+			with_text_fields(c, secret, known, fetch)
+		end)
 	end)
 end
 
@@ -773,12 +971,14 @@ ops.components = function(cx, pane, q)
 	end)
 end
 
--- Stores where the task card posts: q.project (q.project_name) and q.component, a component
--- id ("none" for none; absent keeps the project's stored one).
+-- Stores where the task card posts: q.project (q.project_name), q.component, a component id
+-- ("none" for none; absent keeps the project's stored one), and q.type (q.type_name), an
+-- issue type id (absent keeps the stored one).
 ops.target = function(cx, pane, q)
 	local c = read_config()
 	local project = str(q.project)
-	local err = if project then set_target(c, project, str(q.project_name), str(q.component), str(q.component_name)) else nil
+	local kind: IssueType? = if str(q.type) then { id = q.type, name = str(q.type_name) or q.type } else nil
+	local err = if project then set_target(c, project, str(q.project_name), str(q.component), str(q.component_name), kind) else nil
 	with_token(cx, function(_secret, _err, fresh)
 		answer(fresh, pane, "target", q, {
 			status = snapshot(c),
@@ -787,9 +987,117 @@ ops.target = function(cx, pane, q)
 	end)
 end
 
--- Creates an issue from the task q.task: q.summary, q.description, the project's issue type
--- (issue_type) and the component q.component (empty: none), then stores that project and
--- component as the task card's target.
+-- What the task card can fill in for a new issue of q.project: its issue types and, for
+-- q.type (an id; else issue_type's pick, and `default` says so), the fields of that type's
+-- create screen as field_spec describes them, in Jira's order, and whether its description
+-- (the task's notes) is required. Jira Data Center before 8.4 only has the old createmeta,
+-- which lists every type's fields at once.
+ops.meta = function(cx, pane, q)
+	local project = str(q.project)
+	if not project then
+		answer(cx, pane, "meta", q, { error = "Pick a project first." })
+		return
+	end
+	local function fail(at: WindowCx?, err: string?)
+		answer(at, pane, "meta", q, { project = project, error = err or "Unknown error" })
+	end
+	-- `raw` holds the createmeta fields, with their ids as keys or not (newer createmeta).
+	local function reply(at: WindowCx?, list: any, kind: IssueType, raw: { [any]: any }, sorted: boolean)
+		local fields: { Reply } = {}
+		local notes_required = false
+		for key, f in raw do
+			local id = if type(f) == "table" then str(f.fieldId) or str(f.key) or (if type(key) == "string" then key else nil) else nil
+			if id == "description" and f.required == true then
+				notes_required = true
+			end
+			local spec = field_spec(f, if type(key) == "string" then key else nil)
+			if spec then
+				table.insert(fields, spec)
+			end
+		end
+		if sorted then
+			-- The old createmeta keys fields by id, so its order is lost: required first.
+			table.sort(fields, function(a: Reply, b: Reply): boolean
+				if a.required ~= b.required then
+					return a.required == true
+				end
+				return string.lower(a.name) < string.lower(b.name)
+			end)
+		end
+		answer(at, pane, "meta", q, {
+			project = project,
+			types = type_list(list),
+			type = kind,
+			default = str(q.type) ~= kind.id,
+			fields = fields,
+			notes_required = notes_required,
+		})
+	end
+	connected(cx, pane, "meta", q, function(c, secret, now)
+		local base = "/rest/api/2/issue/createmeta/" .. link.encode(project) .. "/issuetypes"
+		local function legacy(at: WindowCx?)
+			local path = "/rest/api/2/issue/createmeta?projectKeys=" .. link.encode(project) .. "&expand=projects.issuetypes.fields"
+			local failed = call(c, secret, "GET", path, nil, function(data, err, later)
+				if err then
+					fail(later, err)
+					return
+				end
+				local p = if type(data) == "table" and type(data.projects) == "table" then data.projects[1] else nil
+				local list = if type(p) == "table" and type(p.issuetypes) == "table" then p.issuetypes else {}
+				local kind = pick_type(list, str(q.type))
+				if not kind then
+					fail(later, "Jira offers no issue type to create in " .. project .. ".")
+					return
+				end
+				local raw: { [any]: any } = {}
+				for _, t in list do
+					if type(t) == "table" and tostring(t.id) == kind.id and type(t.fields) == "table" then
+						raw = t.fields
+					end
+				end
+				reply(later, list, kind, raw, true)
+			end)
+			if failed then
+				fail(at, failed)
+			end
+		end
+		local failed = all(c, secret, base, { "values", "issueTypes", "results" }, function(list, err, after, status)
+			if not list then
+				if status == 404 then
+					legacy(after)
+				else
+					fail(after, err)
+				end
+				return
+			end
+			local kind = pick_type(list, str(q.type))
+			if not kind then
+				fail(after, "Jira offers no issue type to create in " .. project .. ".")
+				return
+			end
+			local path = base .. "/" .. link.encode(kind.id)
+			local ffailed = all(c, secret, path, { "fields", "values", "results" }, function(items, ferr, later)
+				if not items then
+					fail(later, ferr)
+					return
+				end
+				reply(later, list, kind, items, false)
+			end)
+			if ffailed then
+				fail(after, ffailed)
+			end
+		end)
+		if failed then
+			fail(now, failed)
+		end
+	end)
+end
+
+-- Creates an issue from the task q.task: q.summary, q.description, the issue type q.type
+-- (q.type_name; without one the project's issue_type), the component q.component (empty:
+-- none) and q.fields, a JSON object of further field values already in Jira's shape. The
+-- user fields listed in q.users (comma-separated ids) are set to the signed-in user. Then
+-- stores that project, component and type as the task card's target.
 ops.create = function(cx, pane, q)
 	local project = str(q.project)
 	local summary = summary_of(q.summary)
@@ -801,22 +1109,34 @@ ops.create = function(cx, pane, q)
 		return
 	end
 	local component = str(q.component)
+	local extra: { [string]: any } = {}
+	if str(q.fields) then
+		local ok, decoded = pcall(tern.json.decode, q.fields)
+		if ok and type(decoded) == "table" then
+			extra = decoded
+		end
+	end
+	local users: { string } = {}
+	for id in string.gmatch(q.users or "", "[^,]+") do
+		table.insert(users, id)
+	end
 	local function fail(at: WindowCx?, err: string?)
 		answer(at, pane, "create", q, { task = q.task, error = err or "Unknown error" })
 	end
 	connected(cx, pane, "create", q, function(c, secret, now)
-		local path = "/rest/api/2/project/" .. link.encode(project) .. "?expand=issueTypes"
-		local failed = call(c, secret, "GET", path, nil, function(info, err, after)
-			if err then
-				fail(after, err)
-				return
+		local function post(at: WindowCx?, kind: IssueType, me: Reply?)
+			local fields: { [string]: any } = {}
+			for id, value in extra do
+				if type(id) == "string" and not OWN_FIELDS[id] then
+					fields[id] = value
+				end
 			end
-			local kind = issue_type(if type(info) == "table" then info.issueTypes else nil)
-			if not kind then
-				fail(after, "Jira offers no issue type to create in " .. project .. ".")
-				return
+			for _, id in users do
+				fields[id] = me
 			end
-			local fields: { [string]: any } = { project = { key = project }, summary = summary, issuetype = { id = kind.id } }
+			fields.project = { key = project }
+			fields.summary = summary
+			fields.issuetype = { id = kind.id }
 			if str(q.description) then
 				fields.description = q.description
 			end
@@ -834,7 +1154,7 @@ ops.create = function(cx, pane, q)
 					return
 				end
 				local stored = read_config()
-				local werr = set_target(stored, project, str(q.project_name), component or "none", str(q.component_name))
+				local werr = set_target(stored, project, str(q.project_name), component or "none", str(q.component_name), kind)
 				answer(later, pane, "create", q, {
 					task = q.task,
 					key = key,
@@ -847,8 +1167,50 @@ ops.create = function(cx, pane, q)
 				})
 			end)
 			if pfailed then
-				fail(after, pfailed)
+				fail(at, pfailed)
 			end
+		end
+		-- User fields set to "me": Jira Cloud names users by accountId, Data Center by name.
+		local function as_me(at: WindowCx?, kind: IssueType)
+			if #users == 0 then
+				post(at, kind, nil)
+				return
+			end
+			local failed = call(c, secret, "GET", "/rest/api/2/myself", nil, function(me, err, later)
+				if err then
+					fail(later, err)
+					return
+				end
+				local who: Reply? = if type(me) ~= "table" then nil
+					elseif str(me.accountId) then { accountId = me.accountId }
+					elseif str(me.name) then { name = me.name }
+					else nil
+				if not who then
+					fail(later, "Jira did not say who you are, so the fields set to you cannot be filled.")
+					return
+				end
+				post(later, kind, who)
+			end)
+			if failed then
+				fail(at, failed)
+			end
+		end
+		if str(q.type) then
+			as_me(now, { id = q.type, name = str(q.type_name) or q.type })
+			return
+		end
+		local path = "/rest/api/2/project/" .. link.encode(project) .. "?expand=issueTypes"
+		local failed = call(c, secret, "GET", path, nil, function(info, err, after)
+			if err then
+				fail(after, err)
+				return
+			end
+			local kind = issue_type(if type(info) == "table" then info.issueTypes else nil)
+			if not kind then
+				fail(after, "Jira offers no issue type to create in " .. project .. ".")
+				return
+			end
+			as_me(after, kind)
 		end)
 		if failed then
 			fail(now, failed)

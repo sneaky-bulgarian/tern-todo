@@ -21,6 +21,7 @@
 	--tp-select: rgb(from var(--t1) r g b / 6%);
 	--tp-card: rgb(from var(--t1) r g b / 4%);
 	--tp-chip: rgb(from var(--t1) r g b / 7%);
+	--tp-jira: #4c9aff;
 	font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif;
 	padding: 36px 44px 20px;
 	gap: 0;
@@ -315,7 +316,7 @@
 	& [data-role='todo-proto.detail'] {
 		flex: 1 1 300px;
 		min-width: 0;
-		max-width: 420px;
+		max-width: 440px;
 		max-height: 80vh;
 		overflow-y: auto;
 		display: flex;
@@ -758,6 +759,19 @@
 		color: var(--tp-mute);
 	}
 
+	/* Jira needs the field (an accent star), or Post to Jira found it empty or wrong (red). */
+	& [data-role='todo-proto.plabel'][data-state='required']::after,
+	& [data-role='todo-proto.plabel'][data-state='missing']::after {
+		content: '*';
+		margin-left: 3px;
+		color: var(--tp-jira);
+	}
+
+	& [data-role='todo-proto.plabel'][data-state='missing'],
+	& [data-role='todo-proto.plabel'][data-state='missing']::after {
+		color: var(--bad);
+	}
+
 	& [data-role='todo-proto.pval'] {
 		flex: 1 1 0;
 		min-width: 0;
@@ -975,6 +989,56 @@
 		min-width: 0;
 	}
 
+	/* The ticket view: Everyone / Only mine as one segmented track, then the grouping pill. */
+	& [data-role='todo-proto.jfilter'] {
+		display: flex;
+		flex-direction: row;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+		margin-top: 10px;
+		padding: 0 18px;
+	}
+
+	& [data-role='todo-proto.jseg'] {
+		display: flex;
+		flex-direction: row;
+		gap: 2px;
+		padding: 3px;
+		border-radius: 999px;
+		border: 1px solid var(--tp-line);
+	}
+
+	& [data-role='todo-proto.jseg'] [data-role='todo-proto.tabbtn'] {
+		padding: 4px 12px;
+		font-size: 13px;
+	}
+
+	& [data-role='todo-proto.jfilter'] [data-role='todo-proto.pillbtn'] {
+		flex: 0 1 auto;
+		min-width: 0;
+		height: 32px;
+		padding-top: 0;
+		padding-bottom: 0;
+		line-height: 32px;
+		font-size: 13px;
+	}
+
+	/* "Only mine" and nothing is yours: the reason, and the way back to everyone's. */
+	& [data-role='todo-proto.jempty'] {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 10px;
+		padding: 0 0 8px;
+	}
+
+	& [data-role='todo-proto.jempty'] [data-role='todo-proto.pill'] {
+		margin-left: 18px;
+		padding: 8px 16px;
+		font-size: 14px;
+	}
+
 	/* The account pill: a green dot for the live connection, pushed to the bar's end. */
 	& [data-role='todo-proto.pillbtn'][data-icon='jira'] {
 		margin-left: auto;
@@ -1039,7 +1103,9 @@
 		color: var(--tp-soft);
 	}
 
-	& [data-role='todo-proto.jdesc'][data-empty='true'] {
+	& [data-role='todo-proto.jdesc-none'] {
+		font-size: 14px;
+		line-height: 1.5;
 		color: var(--tp-faint);
 	}
 
@@ -1088,6 +1154,176 @@
 		gap: 10px;
 		margin-top: 8px;
 	}
+
+	/* A ticket's long text field (Definition of Done…): its name over its text. */
+	& [data-role='todo-proto.jsec'] {
+		margin-bottom: -8px;
+		font-size: 11px;
+		font-weight: 600;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--tp-faint);
+	}
+
+	/* The task card's Jira issue draft: a panel of its own, Jira blue along its left edge. Rows
+	   keep the card's label column; long texts sit under their names at full width. */
+	& [data-role='todo-proto.jcomp'] {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		padding: 14px 16px 16px 18px;
+		border-radius: 16px;
+		border: 1px solid var(--tp-line);
+		background: var(--tp-card);
+		box-shadow: inset 3px 0 0 var(--tp-jira);
+	}
+
+	& [data-role='todo-proto.jc-head'] {
+		display: flex;
+		flex-direction: row;
+		align-items: baseline;
+		gap: 8px;
+	}
+
+	& [data-role='todo-proto.jc-mark'] {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--tp-jira);
+	}
+
+	& [data-role='todo-proto.jc-sub'] {
+		font-size: 12px;
+		color: var(--tp-faint);
+	}
+
+	& [data-role='todo-proto.jc-rows'] {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	& [data-role='todo-proto.jc-texts'] {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	& [data-role='todo-proto.jc-block'] {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+
+	& [data-role='todo-proto.jc-block'] [data-role='todo-proto.plabel'] {
+		width: auto;
+	}
+
+	/* One-line fields in a row's value column, as tall as its pills; long texts as a box. */
+	& [data-role='todo-proto.jc-input'],
+	& [data-role='todo-proto.jc-area'] {
+		border: 1px solid var(--tp-line);
+		background: transparent;
+		box-shadow: none;
+		color: var(--tp-ink);
+	}
+
+	& [data-role='todo-proto.jc-input'] {
+		flex: 1 1 auto;
+		min-width: 0;
+		height: 30px;
+		padding: 0 12px;
+		border-radius: 8px;
+		font-size: 13.5px;
+		line-height: 28px;
+	}
+
+	& [data-role='todo-proto.jc-area'] {
+		min-height: 64px;
+		padding: 8px 12px;
+		border-radius: 10px;
+		font-size: 14px;
+		line-height: 1.45;
+	}
+
+	& [data-role='todo-proto.jc-input'].focused,
+	& [data-role='todo-proto.jc-area'].focused {
+		border-color: rgb(from var(--tp-jira) r g b / 60%);
+		background: transparent;
+		box-shadow: none;
+	}
+
+	& [data-role='todo-proto.jc-input'] .sf-ed-ph,
+	& [data-role='todo-proto.jc-area'] .sf-ed-ph {
+		color: var(--tp-faint);
+	}
+
+	& [data-role='todo-proto.jc-input']:not(.focused) .sf-caret,
+	& [data-role='todo-proto.jc-area']:not(.focused) .sf-caret {
+		display: none;
+	}
+
+	& [data-role='todo-proto.jc-na'] {
+		font-size: 13px;
+		color: var(--tp-faint);
+	}
+
+	& [data-role='todo-proto.jc-note'] {
+		display: flex;
+		flex-direction: row;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+		font-size: 12.5px;
+		line-height: 1.45;
+		color: var(--tp-mute);
+	}
+
+	& [data-role='todo-proto.jc-note'][data-tone='error'] {
+		color: var(--bad);
+	}
+
+	& [data-role='todo-proto.jc-note'][data-tone='warning'] {
+		color: var(--warn);
+	}
+
+	/* Quiet text buttons: more fields, retry. */
+	& [data-role='todo-proto.jc-more'] {
+		padding: 5px 10px;
+		border-radius: 999px;
+		background: transparent;
+		color: var(--tp-mute);
+		font-size: 12.5px;
+		cursor: pointer;
+	}
+
+	& [data-role='todo-proto.jc-more']:hover,
+	& [data-role='todo-proto.jc-more'][data-open='true'] {
+		background: var(--tp-chip);
+		color: var(--tp-ink);
+	}
+
+	& [data-role='todo-proto.jc-foot'] {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		gap: 10px;
+		margin-left: -10px;
+	}
+
+	& [data-role='todo-proto.pill'][data-kind='jira'] {
+		margin-left: auto;
+		padding: 8px 16px;
+		font-size: 14px;
+		background: rgb(from var(--tp-jira) r g b / 16%);
+		color: var(--tp-jira);
+	}
+
+	& [data-role='todo-proto.pill'][data-kind='jira']:hover {
+		background: rgb(from var(--tp-jira) r g b / 26%);
+		color: var(--tp-jira);
+	}
 }
 
 [data-theme='light'] .sf-main[data-surface='plugin.todo-proto.list'] {
@@ -1097,6 +1333,7 @@
 	--tp-lv-medium: #1a7f37;
 	--tp-lv-high: #9a6700;
 	--tp-lv-xhigh: #8250df;
+	--tp-jira: #0c66e4;
 }
 
 .sf-dock[data-surface='plugin.todo-proto.list'] {
