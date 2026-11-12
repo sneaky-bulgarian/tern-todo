@@ -26,17 +26,22 @@
 -- `edit` events and cmd+z as `undo`. The block's `Field` model applies those, plus the
 -- keys Tern leaves to the program (typing, deletes, word moves, ctrl+a, redo).
 --
--- Tickets tab (Jira): the window half holds the connection (jira.luau; the token is in the
+-- Jira tickets tab: the window half holds the connection (jira.luau; the token is in the
 -- keychain) and this block asks it over "todo-jira:" links (jira-link.luau). The tab lists the
--- active sprint of the chosen board. Keys: j/k move, Enter starts the ticket (adds it as a task
--- linked by `jira.key` and launches it like Enter on a task), a adds it without starting, o
--- opens it in Jira, r reloads, p picks the project, b the board, c edits the connection. A
--- linked task that turns done moves its issue to a done status in Jira (see `rewrite`).
+-- active sprint of the chosen board, grouped by assignee (you first) or status, or not at all,
+-- and optionally only your tickets (Jira.view, kept in tern.kv "jira_view"). Keys: j/k move,
+-- Enter starts the ticket (adds it as a task linked by `jira.key` and launches it like Enter
+-- on a task), a adds it without starting, o opens it in Jira, m only mine, s grouping, r
+-- reloads, p picks the project, b the board, c edits the connection. A linked task that turns
+-- done moves its issue to a done status in Jira (see `rewrite`).
 --
--- Task card → Jira: while Jira is connected, an unlinked open task's card has Project and
--- Component rows and Post to Jira (Add and post to Jira on a new task), which creates the issue
--- and links the task to it. Nothing stored preselects the Tickets tab's project (else Jira's
--- first) and the project's first component; a pick or a post stores them (jira.target).
+-- Task card → Jira: while Jira is connected, an unlinked open task's card is also the draft of
+-- its Jira issue: project, issue type, component, and the fields Jira's create screen has for
+-- that type (required ones, long texts such as Definition of Done, priority, labels…; the rest
+-- behind "more fields"). Post to Jira (Add and post to Jira on a new task) creates the issue:
+-- title as summary, notes as description. Nothing stored preselects the Tickets tab's project
+-- (else Jira's first), Jira's default type and the project's first component; a pick or a post
+-- stores them (jira.target). Field values stay on the task (`jira_fields`) until it is posted.
 
 local ui = tern.ui
 local session = require("./session")
@@ -122,6 +127,8 @@ local SEARCH: { [string]: string } = {
 	jira_board = "Search boards",
 	jira_target = "Search projects",
 	jira_component = "Search components",
+	jira_type = "Search issue types",
+	jira_field = "Search values",
 }
 
 -- Settings (tern.kv "settings", shared by every Todos block and window; absent keys use
@@ -149,6 +156,13 @@ jira.STALE_S = 60
 jira.WAIT_MS = 120 * 1000
 jira.TONE = { new = "muted", indeterminate = "accent", done = "success" } :: { [string]: string }
 jira.TOKEN_PAGE = "https://id.atlassian.com/manage-profile/security/api-tokens"
+-- How the tab groups tickets (Jira.view.group), in the order its popover lists them; the
+-- choice and "only mine" persist in tern.kv VIEW_KEY, shared by every block.
+jira.GROUPS = { "assignee", "status", "none" }
+jira.GROUP_LABEL = { assignee = "Assignee", status = "Status", none = "No grouping" } :: { [string]: string }
+jira.VIEW_KEY = "jira_view"
+-- Status groups follow Jira's status categories: to do, in progress, done.
+jira.CATEGORY_RANK = { new = 1, indeterminate = 2, done = 3 } :: { [string]: number }
 
 
 type Links = { tern_pane: number?, cwd: string?, omp_session: string? }
@@ -173,6 +187,9 @@ type Todo = {
 	updated: string?,
 	completed: string?,
 	jira: JiraLink?,
+	-- What Post to Jira fills in, by Jira field id: text as typed, a choice as { id, name } (a
+	-- list of them for a multi-choice field), "me" for a user field.
+	jira_fields: { [string]: any }?,
 }
 
 type Model = { selector: string, id: string, provider: string, reasoning: boolean, efforts: { string }, context: string }
@@ -187,13 +204,35 @@ type Ticket = {
 	category: string,
 	kind: string?,
 	assignee: string?,
+	-- The assignee's Jira id (Cloud accountId, Data Center name).
+	assignee_id: string?,
 	priority: string?,
 	description: string?,
+	-- Its long text fields that hold something (Definition of Done…), as { name, text }.
+	details: { { name: string, text: string } },
 	sprint: string?,
 }
+-- A run of the Jira tickets tab's rows under one header: `id` is "me", "a:<assignee id>",
+-- "none" (unassigned), "s:<status>", or "all" (no grouping, no header).
+type TicketGroup = { id: string, label: string, tickets: { Ticket }, rank: number, order: number }
 type JiraProject = { key: string, name: string }
 type JiraBoard = { id: number, name: string, kind: string? }
 type JiraComponent = { id: string, name: string }
+type JiraType = { id: string, name: string }
+type JiraChoice = { id: string, name: string }
+-- A field the task card fills in for a new issue, as jira.luau's field_spec describes it.
+type JiraField = {
+	id: string,
+	name: string,
+	required: boolean,
+	-- Jira fills it in when the card leaves it empty.
+	default: boolean,
+	default_name: string?,
+	kind: string,
+	multi: boolean,
+	multiline: boolean,
+	choices: { JiraChoice },
+}
 type Sprint = { id: number, name: string, ends: string? }
 -- What the Tickets tab knows. `conn` is "unknown" until the window first answers, then
 -- "connected" or "disconnected". `busy` and `last` are keyed by request slot: the op,
@@ -204,6 +243,8 @@ type Jira = {
 	url: string?,
 	email: string?,
 	user: string?,
+	-- Your Jira id (jira.luau's Config.me); nil for a connection that never said it.
+	me: string?,
 	project: JiraProject?,
 	board: JiraBoard?,
 	projects: { JiraProject }?,
@@ -224,11 +265,30 @@ type Jira = {
 	-- A project was just picked: open the board picker once its boards arrive (several).
 	want_board: boolean,
 	-- Where the task card posts new issues, as the window stores it: the project, and per
-	-- project key its component (false: none). Either one unset falls back to a default (see
-	-- jira.target). `comps` holds each project's components once loaded, `comps_error` why not.
-	post: { project: JiraProject?, components: { [string]: JiraComponent | boolean } },
+	-- project key its component (false: none) and issue type. Unset ones fall back to a default
+	-- (see jira.target, jira.kind). `comps` holds each project's components once loaded,
+	-- `comps_error` why not.
+	post: { project: JiraProject?, components: { [string]: JiraComponent | boolean }, types: { [string]: JiraType } },
 	comps: { [string]: { JiraComponent } },
 	comps_error: { [string]: string },
+	-- Per project: its issue types, Jira's default one, why they could not be loaded, and
+	-- whether its description is required; per "<project>:<type id>" the create screen's fields.
+	types: { [string]: { JiraType } },
+	def_type: { [string]: JiraType },
+	meta_error: { [string]: string },
+	notes_required: { [string]: boolean },
+	fields: { [string]: { JiraField } },
+	-- The card shows every field, not only the main ones (jira.main_field).
+	more: boolean,
+	-- Fields Post to Jira found empty or invalid, for task `missing_task`.
+	missing: { [string]: boolean },
+	missing_task: string?,
+	-- The field the choice popover (jira_field) or the text field (focus "jx") is for.
+	pick_field: string?,
+	jx_field: string?,
+	-- The tickets tab's grouping and "only mine" (persisted), and the groups folded shut here.
+	view: { mine: boolean, group: string },
+	folded: { [string]: boolean },
 }
 
 -- Popover state. `kind` is project, model or chat; `text` is the search
@@ -253,8 +313,8 @@ type State = {
 	cursor: string?,
 	error: string?,
 	timer: TimerHandle?,
-	-- "add" (the add row), "title" or "notes" (the detail fields), "picker" (a popover) or
-	-- nil (list keys).
+	-- "add" (the add row), "title" or "notes" (the detail fields), "picker" (a popover), "jx"
+	-- (a Jira field of the task card, jira.jx_field), a connection form field, or nil (list keys).
 	focus: string?,
 	detail_open: boolean,
 	fresh: Todo?,
@@ -332,6 +392,8 @@ type State = {
 	jurl: Field,
 	jemail: Field,
 	jtoken: Field,
+	-- Draft of the Jira field being typed in (focus "jx").
+	jx: Field,
 }
 
 -- A pane ID survives Restart; the state object identifies this block run.
@@ -477,6 +539,7 @@ local function parse(text: string): ({ Todo }?, string?)
 				jira = if type(item.jira) == "table" and str_or_nil(item.jira.key)
 					then { key = item.jira.key, url = str_or_nil(item.jira.url) }
 					else nil,
+				jira_fields = if type(item.jira_fields) == "table" then item.jira_fields else nil,
 			})
 		end
 	end
@@ -835,6 +898,8 @@ function jira.ask(state: State, op: string, query: { [string]: string }?)
 			state.cx:toast("error", "Could not post the task to Jira", message)
 		elseif op == "components" then
 			j.comps_error[tostring(query and query.project)] = message
+		elseif op == "meta" then
+			j.meta_error[tostring(query and query.project)] = message
 		else
 			j.error = message
 		end
@@ -997,6 +1062,7 @@ local function add_task(state: State, title: string): string?
 			done = false,
 			backlog = if state.tab == "backlog" then true else nil,
 			links = if draft then table.clone(draft.links) else (if cwd then { cwd = cwd } else {}),
+			jira_fields = if draft then draft.jira_fields else nil,
 		})
 	end)
 	if not written then
@@ -3179,16 +3245,51 @@ function jira.field(state: State, name: string?): Field?
 		else nil
 end
 
+-- Sets (nil clears) the value of Jira field `fid` on task `id`, the new task's draft included.
+function jira.set_value(state: State, id: string, fid: string, value: any)
+	patch(state, id, function(item)
+		local values = if type(item.jira_fields) == "table" then item.jira_fields else {}
+		values[fid] = value
+		item.jira_fields = if next(values) ~= nil then values else nil
+	end)
+	if state.jira.missing_task == id then
+		state.jira.missing[fid] = nil
+	end
+end
+
+-- Writes the Jira field being typed in (focus "jx") to its task: "live" and "commit" keep the
+-- draft, "cancel" puts back what the field held when typing began. Blank clears the value.
+function jira.save_text(state: State, mode: string)
+	local f, fid = state.jx, state.jira.jx_field
+	local id = f.task
+	if not id or not fid then
+		return
+	end
+	if mode == "cancel" then
+		reset_field(f, f.base)
+		f.task = id
+	end
+	local value: string? = if trim(f.text) == "" then nil else f.text
+	local t = if state.fresh and state.fresh.id == id then state.fresh else todo_by_id(state, id)
+	local held = if t and t.jira_fields then t.jira_fields[fid] else nil
+	if held ~= value then
+		jira.set_value(state, id, fid, value)
+	end
+end
+
 local function set_focus(state: State, field: string?)
-	-- A new task lives while its add row, its notes or a popover has focus.
-	local drop = state.fresh ~= nil and field ~= "add" and field ~= "notes" and field ~= "picker"
-		and (state.focus == "add" or state.focus == "notes" or state.focus == "picker")
+	-- A new task lives while its add row, its notes, a Jira field or a popover has focus.
+	local drop = state.fresh ~= nil and field ~= "add" and field ~= "notes" and field ~= "picker" and field ~= "jx"
+		and (state.focus == "add" or state.focus == "notes" or state.focus == "picker" or state.focus == "jx")
 	if state.focus == "title" and field ~= "title" then
 		save_field(state, state.title, "title", "commit")
 		state.title.task = nil
 	elseif state.focus == "notes" and field ~= "notes" then
 		save_field(state, state.notes, "notes", "commit")
 		state.notes.task = nil
+	elseif state.focus == "jx" and field ~= "jx" then
+		jira.save_text(state, "commit")
+		state.jx.task = nil
 	end
 	if drop then
 		drop_fresh(state)
@@ -3223,6 +3324,11 @@ local function set_focus(state: State, field: string?)
 		id = "main.ws.detail.head.title_" .. state.title.rev
 	elseif field == "picker" and state.pick and SEARCH[state.pick.kind] then
 		id = "layer.q_" .. state.pick.q.rev
+	elseif field == "jx" then
+		local spec = jira.spec(state, state.jira.jx_field)
+		if spec then
+			id = jira.jx_path(spec) .. "-r" .. state.jx.rev
+		end
 	elseif field and jira.field(state, field) then
 		id = "main.ws.jform." .. field .. "_" .. (jira.field(state, field) :: Field).rev
 	end
@@ -3280,6 +3386,7 @@ local function field_of(state: State, id: string): Field?
 		elseif state.focus == "notes" then state.notes
 		elseif state.focus == "title" then state.title
 		elseif state.focus == "picker" and state.pick then state.pick.q
+		elseif state.focus == "jx" then state.jx
 		else jira.field(state, state.focus)
 	return if f and f.id == id then f else nil
 end
@@ -3296,9 +3403,34 @@ local function field_changed(state: State)
 	elseif state.focus == "picker" and state.pick then
 		state.pick.sel = 0
 		state.pick.hint = nil
+	elseif state.focus == "jx" then
+		jira.save_text(state, "live")
 	elseif jira.field(state, state.focus) then
 		state.jira.form_error = nil
 	end
+end
+
+-- Starts typing in the Jira field `fid` of the selected task's card (focus "jx"); the field
+-- typed in before is written first.
+function jira.focus_field(state: State, fid: string)
+	local t = selected(state)
+	local spec = jira.spec(state, fid)
+	if not t or not spec then
+		return
+	end
+	local j = state.jira
+	if state.focus == "jx" then
+		if j.jx_field == fid then
+			return
+		end
+		jira.save_text(state, "commit")
+	end
+	local value = if t.jira_fields then t.jira_fields[fid] else nil
+	j.jx_field = fid
+	reset_field(state.jx, if type(value) == "string" then value else "")
+	state.jx.multiline = not jira.inline(spec)
+	state.jx.task = t.id
+	set_focus(state, "jx")
 end
 
 -- Jira (Tickets tab) ------------------------------------------------------------
@@ -3327,10 +3459,45 @@ function jira.new(): Jira
 		cursor = nil,
 		editing = false,
 		want_board = false,
-		post = { project = nil, components = {} },
+		post = { project = nil, components = {}, types = {} },
 		comps = {},
 		comps_error = {},
+		types = {},
+		def_type = {},
+		meta_error = {},
+		notes_required = {},
+		fields = {},
+		more = false,
+		missing = {},
+		missing_task = nil,
+		pick_field = nil,
+		jx_field = nil,
+		view = jira.read_view(),
+		folded = {},
 	}
+end
+
+-- The tickets tab's stored view (VIEW_KEY): grouping by assignee unless set otherwise.
+function jira.read_view(): { mine: boolean, group: string }
+	local ok, v = pcall(tern.kv.get, jira.VIEW_KEY)
+	local t: { [string]: any } = if ok and type(v) == "table" then v else {}
+	return {
+		mine = t.mine == true,
+		group = if type(t.group) == "string" and jira.GROUP_LABEL[t.group] then t.group else "assignee",
+	}
+end
+
+-- Changes the tickets tab's view (nil keeps that part) and stores it for every block.
+function jira.set_view(state: State, mine: boolean?, group: string?)
+	local j = state.jira
+	if mine ~= nil then
+		j.view.mine = mine
+	end
+	if group and jira.GROUP_LABEL[group] then
+		j.view.group = group
+		j.folded = {}
+	end
+	pcall(tern.kv.set, jira.VIEW_KEY, j.view)
 end
 
 -- Takes the connection snapshot the window sends with most answers.
@@ -3339,10 +3506,12 @@ function jira.apply_status(state: State, s: any)
 	j.conn = if s.connected == true then "connected" else "disconnected"
 	if str_or_nil(s.url) ~= j.url then
 		j.comps, j.comps_error = {}, {}
+		j.types, j.def_type, j.meta_error, j.notes_required, j.fields = {}, {}, {}, {}, {}
 	end
 	j.url, j.email, j.user = str_or_nil(s.url), str_or_nil(s.email), str_or_nil(s.user)
+	j.me = str_or_nil(s.me)
 	local p, b, post = s.project, s.board, s.post
-	local target: { project: JiraProject?, components: { [string]: JiraComponent | boolean } } = { project = nil, components = {} }
+	local target: { project: JiraProject?, components: { [string]: JiraComponent | boolean }, types: { [string]: JiraType } } = { project = nil, components = {}, types = {} }
 	if type(post) == "table" then
 		local pp = post.project
 		if type(pp) == "table" and str_or_nil(pp.key) then
@@ -3353,6 +3522,11 @@ function jira.apply_status(state: State, s: any)
 				target.components[key] = false
 			elseif type(key) == "string" and type(v) == "table" and str_or_nil(v.id) then
 				target.components[key] = { id = v.id, name = str_or_nil(v.name) or v.id }
+			end
+		end
+		for key, v in (if type(post.types) == "table" then post.types else {}) :: { [any]: any } do
+			if type(key) == "string" and type(v) == "table" and str_or_nil(v.id) then
+				target.types[key] = { id = v.id, name = str_or_nil(v.name) or v.id }
 			end
 		end
 	end
@@ -3402,8 +3576,73 @@ function jira.load(state: State, force: boolean)
 	end
 end
 
+-- Opening the tab takes the view other blocks may have changed since.
 function jira.enter(state: State)
+	state.jira.view = jira.read_view()
 	jira.load(state, false)
+end
+
+-- Whether the ticket is assigned to you: by Jira id, else (no id known) by display name.
+function jira.is_mine(state: State, tk: Ticket): boolean
+	local j = state.jira
+	if j.me and tk.assignee_id then
+		return tk.assignee_id == j.me
+	end
+	return tk.assignee ~= nil and tk.assignee == j.user
+end
+
+-- The sprint's tickets as the tab shows them: only yours while "only mine" is on, grouped by
+-- assignee (you first, then by name, Unassigned last), by status (to do, in progress, done)
+-- or in one headerless group. Inside a group tickets keep Jira's order (their rank).
+function jira.groups(state: State): { TicketGroup }
+	local j = state.jira
+	local by = j.view.group
+	local groups: { TicketGroup } = {}
+	local index: { [string]: TicketGroup } = {}
+	for _, tk in j.tickets or {} do
+		local mine = jira.is_mine(state, tk)
+		if mine or not j.view.mine then
+			local id, label, rank = "all", "", 0
+			if by == "assignee" and mine then
+				id, label, rank = "me", "Assigned to you", 0
+			elseif by == "assignee" and tk.assignee then
+				id, label, rank = "a:" .. (tk.assignee_id or tk.assignee), tk.assignee, 1
+			elseif by == "assignee" then
+				id, label, rank = "none", "Unassigned", 2
+			elseif by == "status" then
+				id, label, rank = "s:" .. tk.status, tk.status, jira.CATEGORY_RANK[tk.category] or 2
+			end
+			local g: TicketGroup = index[id] or { id = id, label = label, tickets = {}, rank = rank, order = #groups + 1 }
+			if not index[id] then
+				index[id] = g
+				table.insert(groups, g)
+			end
+			table.insert(g.tickets, tk)
+		end
+	end
+	table.sort(groups, function(a: TicketGroup, b: TicketGroup): boolean
+		if a.rank ~= b.rank then
+			return a.rank < b.rank
+		end
+		if by == "assignee" and string.lower(a.label) ~= string.lower(b.label) then
+			return string.lower(a.label) < string.lower(b.label)
+		end
+		return a.order < b.order
+	end)
+	return groups
+end
+
+-- The tickets the tab lists, top to bottom, leaving out those of folded groups.
+function jira.shown(state: State): { Ticket }
+	local out: { Ticket } = {}
+	for _, g in jira.groups(state) do
+		if not state.jira.folded[g.id] then
+			for _, tk in g.tickets do
+				table.insert(out, tk)
+			end
+		end
+	end
+	return out
 end
 
 function jira.choose_project(state: State, p: JiraProject)
@@ -3451,19 +3690,24 @@ function jira.ticket(state: State, key: string?): Ticket?
 	return nil
 end
 
--- The highlighted ticket; the first one when none is.
+-- The highlighted ticket among those the tab lists; the first of them when none is.
 function jira.selected(state: State): Ticket?
 	local j = state.jira
-	local tk = jira.ticket(state, j.cursor)
-	if not tk and j.tickets and j.tickets[1] then
-		tk = j.tickets[1]
+	local list = jira.shown(state)
+	for _, tk in list do
+		if tk.key == j.cursor then
+			return tk
+		end
+	end
+	local tk = list[1]
+	if tk then
 		j.cursor = tk.key
 	end
 	return tk
 end
 
 function jira.move(state: State, delta: number?, to: number?)
-	local list = state.jira.tickets or {}
+	local list = jira.shown(state)
 	local at = 0
 	for i, tk in list do
 		if tk.key == state.jira.cursor then
@@ -3499,6 +3743,9 @@ function jira.add_task(state: State, tk: Ticket): string?
 	local description = if tk.description then trim(tk.description) else ""
 	if description ~= "" then
 		table.insert(notes, description)
+	end
+	for _, d in tk.details do
+		table.insert(notes, d.name .. ":\n" .. d.text)
 	end
 	if url then
 		table.insert(notes, url)
@@ -3578,8 +3825,18 @@ end
 
 -- Notes sent as an issue's description, at most (bytes).
 jira.DESCRIPTION_MAX = 30000
--- Popover kinds of the Jira half; they need no task.
-jira.KINDS = { jira_project = true, jira_board = true, jira_target = true, jira_component = true } :: { [string]: boolean }
+-- Popover kinds of the Jira half; they need no task (jira_type and jira_field act on the card's).
+jira.KINDS = {
+	jira_project = true,
+	jira_board = true,
+	jira_target = true,
+	jira_component = true,
+	jira_type = true,
+	jira_field = true,
+	jira_group = true,
+} :: { [string]: boolean }
+-- Optional fields the card shows without "more fields": the ones most issues set.
+jira.MAIN = { priority = true, labels = true, assignee = true, duedate = true, fixVersions = true } :: { [string]: boolean }
 
 -- `s` cut to at most `max` bytes at a UTF-8 character boundary.
 function jira.clip(s: string, max: number): string
@@ -3624,8 +3881,79 @@ function jira.target(state: State): (JiraProject?, JiraComponent?, boolean)
 	return p, nil, j.comps_error[p.key] ~= nil
 end
 
--- Asks for what jira.target still lacks: the project list, or the target's components. A
--- failed list is not asked again; opening its popover retries.
+-- The issue type Post to Jira creates in `p`: the stored one while Jira still offers it, else
+-- Jira's default. Until the project's types have loaded, the stored one (or nil).
+function jira.kind(state: State, p: JiraProject): JiraType?
+	local j = state.jira
+	local stored = j.post.types[p.key]
+	local list = j.types[p.key]
+	if not list then
+		return stored
+	end
+	if stored then
+		for _, t in list do
+			if t.id == stored.id then
+				return t
+			end
+		end
+	end
+	return j.def_type[p.key] or list[1]
+end
+
+-- The create screen's fields of the card's target project and type (nil until loaded), with
+-- that project and type.
+function jira.form_fields(state: State): ({ JiraField }?, JiraProject?, JiraType?)
+	local p = jira.target(state)
+	local kind = if p then jira.kind(state, p) else nil
+	if not p or not kind then
+		return nil, p, kind
+	end
+	return state.jira.fields[p.key .. ":" .. kind.id], p, kind
+end
+
+-- The card's field `fid`, nil when the target type has none such.
+function jira.spec(state: State, fid: string?): JiraField?
+	local list: { JiraField } = jira.form_fields(state) or {}
+	for _, f in list do
+		if f.id == fid then
+			return f
+		end
+	end
+	return nil
+end
+
+-- Whether the field sits in a labelled row (choices, one-line text) rather than under its
+-- own label (multi-line text).
+function jira.inline(f: JiraField): boolean
+	return not (f.kind == "text" and f.multiline)
+end
+
+-- Node id of a text field's input on the card, without the "-r<rev>" of the one being typed in
+-- (set_focus needs it before the card is drawn; jira.card_rows draws it there).
+function jira.jx_path(f: JiraField): string
+	return if jira.inline(f) then "main.ws.detail.jira.rows.jf-" .. f.id .. ".value.jx-" .. f.id
+		else "main.ws.detail.jira.texts.jf-" .. f.id .. ".jx-" .. f.id
+end
+
+-- Whether Jira refuses the issue while the card leaves the field empty.
+function jira.needed(f: JiraField): boolean
+	return f.required and not f.default
+end
+
+-- Whether the card shows the field while "more fields" is closed: what Jira needs, the custom
+-- long texts (Definition of Done…), the usual ones (MAIN), and any the task already fills in
+-- or is being typed in.
+function jira.main_field(state: State, t: Todo, f: JiraField): boolean
+	local j = state.jira
+	return jira.needed(f) or (f.kind == "text" and f.id ~= "environment") or jira.MAIN[f.id] == true
+		or (t.jira_fields ~= nil and t.jira_fields[f.id] ~= nil)
+		or (state.focus == "jx" and j.jx_field == f.id)
+		or (j.missing_task == t.id and j.missing[f.id] == true)
+end
+
+-- Asks for what the card still lacks: the project list, the target's components, its issue
+-- types and the target type's fields. A failed list is not asked again; opening its popover
+-- (or Retry, for the fields) asks again.
 function jira.prefetch(state: State)
 	local j = state.jira
 	if j.conn ~= "connected" then
@@ -3636,8 +3964,19 @@ function jira.prefetch(state: State)
 		if not j.projects and not j.busy.projects and not j.list_error then
 			jira.ask(state, "projects", nil)
 		end
-	elseif j.comps[p.key] == nil and j.comps_error[p.key] == nil and not j.busy.components then
+		return
+	end
+	if j.comps[p.key] == nil and j.comps_error[p.key] == nil and not j.busy.components then
 		jira.ask(state, "components", { project = p.key })
+	end
+	local kind = jira.kind(state, p)
+	local loaded = j.types[p.key] ~= nil and kind ~= nil and j.fields[p.key .. ":" .. kind.id] ~= nil
+	if not loaded and j.meta_error[p.key] == nil and not j.busy.meta then
+		local q: { [string]: string } = { project = p.key }
+		if kind then
+			q.type = kind.id
+		end
+		jira.ask(state, "meta", q)
 	end
 end
 
@@ -3662,8 +4001,86 @@ function jira.choose_target(state: State, p: JiraProject, component: (string | b
 	jira.prefetch(state)
 end
 
--- Post to Jira: an issue from the task (title, notes) in the target project and component,
--- which the window then stores as the target; its answer links the task (jira.answer).
+-- The issue type picked in the card becomes the project's stored one; its fields load next.
+function jira.choose_type(state: State, p: JiraProject, kind: JiraType)
+	state.jira.post.types[p.key] = kind
+	jira.ask(state, "target", { project = p.key, project_name = p.name, type = kind.id, type_name = kind.name })
+	jira.prefetch(state)
+end
+
+-- Local time's offset from UTC as Jira writes it ("+0100"). Luau's os.time reads a date
+-- table as UTC, so local minus UTC fields is the offset, summer time included.
+function jira.utc_offset(): string
+	local now = os.time()
+	local diff = os.time(os.date("*t", now) :: any) - os.time(os.date("!*t", now) :: any)
+	local sign = if diff < 0 then "-" else "+"
+	diff = math.abs(diff)
+	return string.format("%s%02d%02d", sign, diff // 3600, (diff % 3600) // 60)
+end
+
+-- The task's values for `fields` in the shape Jira's create takes; the user fields set to
+-- "me" (the window fills in the signed-in user); and per field id what is wrong: "required"
+-- for one Jira needs but the task leaves empty, else what the value should look like.
+function jira.payload(t: Todo, fields: { JiraField }): ({ [string]: any }, { string }, { [string]: string })
+	local out: { [string]: any } = {}
+	local users: { string } = {}
+	local bad: { [string]: string } = {}
+	for _, f in fields do
+		local v = if t.jira_fields then t.jira_fields[f.id] else nil
+		local text = if type(v) == "string" then str_or_nil(trim(v)) else nil
+		if f.kind == "choice" and f.multi and type(v) == "table" then
+			local list: { any } = {}
+			for _, c in v do
+				if type(c) == "table" and str_or_nil(c.id) then
+					table.insert(list, { id = c.id })
+				end
+			end
+			out[f.id] = if #list > 0 then list else nil
+		elseif f.kind == "choice" and type(v) == "table" and str_or_nil(v.id) then
+			out[f.id] = { id = v.id }
+		elseif f.kind == "user" and v == "me" then
+			table.insert(users, f.id)
+		elseif text and f.kind == "number" then
+			local n = tonumber(text)
+			if n then
+				out[f.id] = n
+			else
+				bad[f.id] = "a number"
+			end
+		elseif text and f.kind == "date" then
+			if string.match(text, "^%d%d%d%d%-%d%d%-%d%d$") then
+				out[f.id] = text
+			else
+				bad[f.id] = "a date like 2026-11-30"
+			end
+		elseif text and f.kind == "datetime" then
+			local d, h, m = string.match(text, "^(%d%d%d%d%-%d%d%-%d%d)[ T](%d%d?):(%d%d)$")
+			if d and h and m then
+				out[f.id] = string.format("%sT%02d:%s:00.000%s", d, tonumber(h) :: number, m, jira.utc_offset())
+			else
+				bad[f.id] = "a time like 2026-11-30 14:00"
+			end
+		elseif text and f.kind == "labels" then
+			local list: { string } = {}
+			for word in string.gmatch(text, "[^%s,]+") do
+				table.insert(list, word)
+			end
+			out[f.id] = list
+		elseif text and f.kind == "text" then
+			out[f.id] = text
+		end
+		local filled = out[f.id] ~= nil or (f.kind == "user" and v == "me")
+		if not filled and not bad[f.id] and jira.needed(f) then
+			bad[f.id] = if f.kind == "other" then "only settable in Jira" else "required"
+		end
+	end
+	return out, users, bad
+end
+
+-- Post to Jira: an issue from the task (title, notes, the values of its card's Jira fields)
+-- of the target type in the target project and component, which the window then stores as
+-- the target; its answer links the task (jira.answer). Fields Jira needs that the task leaves
+-- empty or holds wrongly stop it, marked on the card (Jira.missing).
 function jira.post(state: State, t: Todo)
 	local j = state.jira
 	if t.jira or t.id == "" or j.busy["create:" .. t.id] or j.conn ~= "connected" then
@@ -3675,12 +4092,20 @@ function jira.post(state: State, t: Todo)
 		state.cx:toast("info", if p then "Loading the components of " .. p.name else "Loading the Jira projects", "Post again in a moment.")
 		return
 	end
+	local fields, _, kind = jira.form_fields(state)
+	-- Without the create screen (Jira refused it) the issue goes out as before the fields
+	-- existed: Jira's default type, title, notes and component.
+	if not fields and j.meta_error[p.key] == nil then
+		jira.prefetch(state)
+		state.cx:toast("info", "Loading the Jira fields of " .. p.name, "Post again in a moment.")
+		return
+	end
 	local title = trim(t.title)
 	if title == "" then
 		state.cx:toast("warning", "Give the task a title first")
 		return
 	end
-	jira.ask(state, "create", {
+	local q: { [string]: string } = {
 		task = t.id,
 		project = p.key,
 		project_name = p.name,
@@ -3688,7 +4113,36 @@ function jira.post(state: State, t: Todo)
 		component_name = if comp then comp.name else "",
 		summary = title,
 		description = jira.clip(trim(t.notes), jira.DESCRIPTION_MAX),
-	})
+	}
+	if fields and kind then
+		local values, users, bad = jira.payload(t, fields)
+		local said: { string } = {}
+		j.missing, j.missing_task = {}, t.id
+		if j.notes_required[p.key] and trim(t.notes) == "" then
+			j.missing.description = true
+			table.insert(said, "Description (the task's notes)")
+		end
+		for _, f in fields do
+			local why = bad[f.id]
+			if why then
+				j.missing[f.id] = true
+				table.insert(said, if why == "required" then f.name else f.name .. ": " .. why)
+			end
+		end
+		if #said > 0 then
+			state.cx:toast("warning", "Fill in before posting to Jira", table.concat(said, " · "))
+			return
+		end
+		j.missing_task = nil
+		q.type, q.type_name = kind.id, kind.name
+		if next(values) ~= nil then
+			q.fields = tern.json.encode(values)
+		end
+		if #users > 0 then
+			q.users = table.concat(users, ",")
+		end
+	end
+	jira.ask(state, "create", q)
 end
 
 -- The answer to create: the new issue's link goes on the task it was made from.
@@ -3705,6 +4159,7 @@ function jira.posted(state: State, data: any, err: string?)
 		for _, item in list do
 			if type(item) == "table" and item.id == task then
 				item.jira = { key = key, url = url }
+				item.jira_fields = nil
 				linked = true
 				return true
 			end
@@ -3879,13 +4334,16 @@ function jira.handle(state: State, op: string, data: any, err: string?, key: str
 					category = str_or_nil(t.category) or "new",
 					kind = str_or_nil(t.kind),
 					assignee = str_or_nil(t.assignee),
+					assignee_id = str_or_nil(t.assignee_id),
 					priority = str_or_nil(t.priority),
 					description = str_or_nil(t.description),
+					details = jira.details_of(t.details),
 					sprint = str_or_nil(t.sprint),
 				})
 			end
 		end
 		j.sprints, j.tickets, j.loaded_at, j.error = sprints, tickets, os.time(), nil
+		j.me = str_or_nil(data.me) or j.me
 		if not jira.ticket(state, j.cursor) then
 			j.cursor = if tickets[1] then tickets[1].key else nil
 		end
@@ -3927,7 +4385,73 @@ function jira.handle(state: State, op: string, data: any, err: string?, key: str
 		end
 	elseif op == "create" then
 		jira.posted(state, data, err)
+	elseif op == "meta" then
+		jira.meta_answer(state, data, err)
 	end
+end
+
+-- A ticket's long text fields as jira.luau sends them ({ name, text }).
+function jira.details_of(list: any): { { name: string, text: string } }
+	local out: { { name: string, text: string } } = {}
+	for _, d in (if type(list) == "table" then list else {}) :: { any } do
+		if type(d) == "table" and str_or_nil(d.name) and str_or_nil(d.text) then
+			table.insert(out, { name = d.name, text = d.text })
+		end
+	end
+	return out
+end
+
+-- The answer to meta: a project's issue types and the fields of one type's create screen.
+function jira.meta_answer(state: State, data: any, err: string?)
+	local j = state.jira
+	local project = str_or_nil(data.project)
+	if not project then
+		return
+	end
+	if err then
+		j.meta_error[project] = err
+		return
+	end
+	j.meta_error[project] = nil
+	local types: { JiraType } = {}
+	for _, t in (if type(data.types) == "table" then data.types else {}) :: { any } do
+		if type(t) == "table" and str_or_nil(t.id) then
+			table.insert(types, { id = t.id, name = str_or_nil(t.name) or t.id })
+		end
+	end
+	j.types[project] = types
+	local k = data.type
+	if type(k) ~= "table" or not str_or_nil(k.id) then
+		return
+	end
+	local kind: JiraType = { id = k.id, name = str_or_nil(k.name) or k.id }
+	if data.default == true then
+		j.def_type[project] = kind
+	end
+	j.notes_required[project] = data.notes_required == true
+	local fields: { JiraField } = {}
+	for _, f in (if type(data.fields) == "table" then data.fields else {}) :: { any } do
+		if type(f) == "table" and str_or_nil(f.id) and str_or_nil(f.kind) then
+			local choices: { JiraChoice } = {}
+			for _, c in (if type(f.choices) == "table" then f.choices else {}) :: { any } do
+				if type(c) == "table" and str_or_nil(c.id) and str_or_nil(c.name) then
+					table.insert(choices, { id = c.id, name = c.name })
+				end
+			end
+			table.insert(fields, {
+				id = f.id,
+				name = str_or_nil(f.name) or f.id,
+				required = f.required == true,
+				default = f.default == true,
+				default_name = str_or_nil(f.default_name),
+				kind = f.kind,
+				multi = f.multi == true,
+				multiline = f.multiline == true,
+				choices = choices,
+			})
+		end
+	end
+	j.fields[project .. ":" .. kind.id] = fields
 end
 
 -- Popovers -----------------------------------------------------------------
@@ -4067,12 +4591,116 @@ local function project_items(state: State, pk: Pick, t: Todo): ({ PickItem }, st
 	return items, if #items == 0 then "No matching projects" else nil
 end
 
+-- What a Jira field shows while the task leaves it empty: Jira's default, else nobody/none.
+function jira.empty_label(f: JiraField): string
+	if f.default then
+		return if f.default_name then "Default: " .. f.default_name else "Default"
+	end
+	return if f.kind == "user" then "Nobody" else "None"
+end
+
+-- Whether the task's value `v` of a choice field holds the choice `id` (one or a list).
+function jira.has_choice(v: any, id: string): boolean
+	if type(v) ~= "table" then
+		return false
+	end
+	if v.id ~= nil then
+		return v.id == id
+	end
+	for _, c in v do
+		if type(c) == "table" and c.id == id then
+			return true
+		end
+	end
+	return false
+end
+
+-- The text of a choice or user field's pill: the task's value, else jira.empty_label.
+function jira.value_label(f: JiraField, v: any): string
+	if v == "me" then
+		return "Me"
+	elseif type(v) == "table" and v.id ~= nil then
+		return str_or_nil(v.name) or tostring(v.id)
+	elseif type(v) == "table" then
+		local names: { string } = {}
+		for _, c in v do
+			if type(c) == "table" then
+				table.insert(names, str_or_nil(c.name) or tostring(c.id))
+			end
+		end
+		if #names > 0 then
+			return table.concat(names, ", ")
+		end
+	end
+	return jira.empty_label(f)
+end
+
+-- Rows of the card's issue type popover, and of the choice popover of a Jira field
+-- (Jira.pick_field): Jira's allowed values, or you for a user field. The none row clears it.
+function jira.field_items(state: State, pk: Pick): ({ PickItem }, string?)
+	local j = state.jira
+	local filter = string.lower(pk.q.text)
+	local items: { PickItem } = {}
+	local p = jira.target(state)
+	if not p then
+		return items, "Pick a Jira project first"
+	end
+	if pk.kind == "jira_type" then
+		local list = j.types[p.key]
+		if not list then
+			return items, if j.busy.meta then "Loading issue types…" else (j.meta_error[p.key] or "No issue types")
+		end
+		local current = jira.kind(state, p)
+		for _, t in list do
+			if filter == "" or contains(t.name, filter) then
+				table.insert(items, { kind = "opt", path = t.id, name = t.name, current = current ~= nil and current.id == t.id })
+			end
+		end
+		return items, if #items == 0 then "No matching issue types" else nil
+	end
+	local f = jira.spec(state, j.pick_field)
+	local t = selected(state)
+	if not f or not t then
+		return items, "Jira no longer has this field"
+	end
+	local v = if t.jira_fields then t.jira_fields[f.id] else nil
+	if filter == "" then
+		table.insert(items, { kind = "none", name = jira.empty_label(f), current = v == nil })
+	end
+	if f.kind == "user" then
+		if filter == "" or contains("me", filter) or (j.user ~= nil and contains(j.user, filter)) then
+			table.insert(items, { kind = "opt", path = "me", name = "Me", hint = j.user, current = v == "me" })
+		end
+		return items, nil
+	end
+	for _, c in f.choices do
+		if filter == "" or contains(c.name, filter) then
+			table.insert(items, { kind = "opt", path = c.id, name = c.name, current = jira.has_choice(v, c.id) })
+		end
+	end
+	return items, if #items > 1 or (filter ~= "" and #items > 0) then nil elseif #f.choices == 0 then "Jira offers no values" else "No matching values"
+end
+
 -- Rows of the Jira popovers: the Tickets tab's project and board, and the task card's target
--- project and component (none needs a task).
+-- project, component, issue type and field values (none needs a task).
 function jira.pick_items(state: State, pk: Pick): ({ PickItem }, string?)
 	local j = state.jira
 	local filter = string.lower(pk.q.text)
 	local items: { PickItem } = {}
+	if pk.kind == "jira_type" or pk.kind == "jira_field" then
+		return jira.field_items(state, pk)
+	end
+	if pk.kind == "jira_group" then
+		local hints: { [string]: string } = {
+			assignee = "You first, then by name",
+			status = "To do, in progress, done",
+			none = "Jira's order",
+		}
+		for _, g in jira.GROUPS do
+			table.insert(items, { kind = "opt", path = g, name = jira.GROUP_LABEL[g], hint = hints[g], current = j.view.group == g })
+		end
+		return items, nil
+	end
 	if pk.kind == "jira_project" or pk.kind == "jira_target" then
 		if not j.projects then
 			return items, if j.busy.projects then "Loading projects…" else (j.list_error or "No projects")
@@ -4255,6 +4883,8 @@ open_picker = function(state: State, kind: string)
 			j.comps_error[p.key] = nil
 			jira.ask(state, "components", { project = p.key })
 		end
+	elseif kind == "jira_type" then
+		jira.prefetch(state)
 	end
 	local initial = picker_items(state)
 	for i, it in initial do
@@ -4266,39 +4896,88 @@ open_picker = function(state: State, kind: string)
 	set_focus(state, "picker")
 end
 
--- Stores the picked value (nil = the default/cleared value), writes the file and closes the popover.
-local function apply_pick(state: State, kind: string, value: string?)
-	local pk = state.pick
-	close_picker(state)
-	if not pk then
+-- A pick in a Jira popover. A multi-choice field's popover stays open: each pick adds or
+-- removes one value; its none row clears them all.
+function jira.apply_pick(state: State, kind: string, value: string?)
+	local j = state.jira
+	local t = selected(state)
+	local f = if kind == "jira_field" then jira.spec(state, j.pick_field) else nil
+	if f and t and f.multi and value then
+		local held = if t.jira_fields then t.jira_fields[f.id] else nil
+		local list: { any } = {}
+		local had = false
+		for _, c in (if type(held) == "table" and held.id == nil then held else {}) :: { any } do
+			if type(c) == "table" and c.id == value then
+				had = true
+			elseif type(c) == "table" then
+				table.insert(list, c)
+			end
+		end
+		for _, c in (if had then {} else f.choices) :: { JiraChoice } do
+			if c.id == value then
+				table.insert(list, { id = c.id, name = c.name })
+			end
+		end
+		jira.set_value(state, t.id, f.id, if #list > 0 then list else nil)
 		return
 	end
-	if kind == "jira_project" then
-		for _, p in state.jira.projects or {} do
+	close_picker(state)
+	if kind == "jira_field" then
+		if not f or not t then
+			return
+		end
+		local chosen: any = nil
+		for _, c in f.choices do
+			if c.id == value then
+				chosen = { id = c.id, name = c.name }
+			end
+		end
+		jira.set_value(state, t.id, f.id, if f.kind == "user" and value == "me" then "me" else chosen)
+	elseif kind == "jira_type" then
+		local p = jira.target(state)
+		local offered: { JiraType } = (if p then j.types[p.key] else nil) or {}
+		for _, kt in offered do
+			if p and kt.id == value then
+				jira.choose_type(state, p, kt)
+			end
+		end
+	elseif kind == "jira_group" then
+		jira.set_view(state, nil, value)
+	elseif kind == "jira_project" then
+		for _, p in j.projects or {} do
 			if p.key == value then
 				jira.choose_project(state, p)
 			end
 		end
-		return
 	elseif kind == "jira_board" then
-		for _, b in state.jira.boards or {} do
+		for _, b in j.boards or {} do
 			if tostring(b.id) == value then
 				jira.choose_board(state, b)
 			end
 		end
-		return
 	elseif kind == "jira_target" then
-		for _, p in state.jira.projects or {} do
+		for _, p in j.projects or {} do
 			if p.key == value then
 				jira.choose_target(state, p, nil)
 			end
 		end
-		return
 	elseif kind == "jira_component" then
 		local p = jira.target(state)
 		if p then
 			jira.choose_target(state, p, value or false)
 		end
+	end
+end
+
+-- Stores the picked value (nil = the default/cleared value), writes the file and closes the popover.
+local function apply_pick(state: State, kind: string, value: string?)
+	local pk = state.pick
+	if pk and jira.KINDS[kind] then
+		jira.apply_pick(state, kind, value)
+		return
+	end
+	close_picker(state)
+	if not pk then
 		return
 	end
 	if kind == "project" then
@@ -4402,6 +5081,21 @@ local function field_key(state: State, key: Key): boolean
 			card.add(state)
 		elseif what == "text" then
 			sync_fresh_title(state)
+		end
+		return true
+	end
+	if state.focus == "jx" then
+		local what = edit_key(state.jx, key, state.cx)
+		if what == nil then
+			return false
+		elseif key.name == "escape" then
+			jira.save_text(state, "cancel")
+		end
+		if what == "blur" or what == "submit" then
+			-- A new task's Jira field hands back to its add row, as its notes do.
+			set_focus(state, if state.fresh then "add" else nil)
+		elseif what == "text" then
+			jira.save_text(state, "live")
 		end
 		return true
 	end
@@ -4687,7 +5381,18 @@ local function gear_button(): Node
 	})
 end
 
--- Tasks · Backlog · Tickets: the tab strip of every tab.
+-- How many sprint tickets pass the "only mine" filter (all of them while it is off).
+function jira.count(state: State): number
+	local n = 0
+	for _, tk in state.jira.tickets or {} do
+		if not state.jira.view.mine or jira.is_mine(state, tk) then
+			n += 1
+		end
+	end
+	return n
+end
+
+-- Tasks · Backlog · Jira tickets: the tab strip of every tab.
 function jira.tabs(state: State): Node
 	local function tab(id: string, text: string): Node
 		return el("button", "tabbtn", "tab-" .. id, {
@@ -4700,7 +5405,7 @@ function jira.tabs(state: State): Node
 	return el("div", "tabs", "tabs", nil, {
 		tab("tasks", "Tasks"),
 		tab("backlog", "Backlog (" .. backlog_count(state) .. ")"),
-		tab("tickets", if tickets then "Tickets (" .. #tickets .. ")" else "Tickets"),
+		tab("tickets", if tickets then "Jira tickets (" .. jira.count(state) .. ")" else "Jira tickets"),
 	})
 end
 
@@ -4794,6 +5499,9 @@ local PICK_TITLE: { [string]: string } = {
 	jira_board = "Board",
 	jira_target = "Jira",
 	jira_component = "Jira",
+	jira_type = "Issue type",
+	jira_field = "Jira",
+	jira_group = "Group tickets by",
 }
 local PICK_NOUN: { [string]: string } = {
 	project = "projects",
@@ -4803,6 +5511,9 @@ local PICK_NOUN: { [string]: string } = {
 	jira_board = "boards",
 	jira_target = "projects",
 	jira_component = "components",
+	jira_type = "issue types",
+	jira_field = "values",
+	jira_group = "groupings",
 }
 
 local function picker_node(state: State): Node?
@@ -4845,7 +5556,8 @@ local function picker_node(state: State): Node?
 		key = "pick",
 		role = ROLE .. "pick",
 		size = "md",
-		title = PICK_TITLE[pk.kind],
+		-- A Jira field's popover is titled by the field.
+		title = if pk.kind == "jira_field" then (jira.spec(state, state.jira.pick_field) or { name = "Jira" }).name else PICK_TITLE[pk.kind],
 		noun = PICK_NOUN[pk.kind],
 		placeholder = SEARCH[pk.kind],
 		query = pk.q.text,
@@ -4951,21 +5663,84 @@ local function chat_title(state: State, t: Todo): string
 	return if state.chats_loading or tried == nil then "Loading chat…" else "Unknown chat"
 end
 
--- A labelled row of the task card: the name in a fixed column, its controls after it.
-function card.row(key: string, label: string, kids: { Node }): Node
+-- A labelled row of the task card: the name in a fixed column, its controls after it. `mark`
+-- flags the name: "required" (Jira needs it) or "missing" (Post to Jira found it lacking).
+function card.row(key: string, label: string, kids: { Node }, mark: string?): Node
 	return el("div", "prop", key, nil, {
-		el("span", "plabel", "label", { text = label }),
+		el("span", "plabel", "label", { text = label, attrs = { ["data-state"] = mark or "none" } }),
 		el("div", "pval", "value", nil, kids),
 	})
 end
 
--- The task card's Jira rows: the linked issue; else, while Jira is connected and the task is
--- open, the project and component Post to Jira uses. Nil when there are none.
-function jira.card_rows(state: State, t: Todo): { Node }?
+-- The mark of a Jira field's name on task `t` (see card.row).
+function jira.mark(state: State, t: Todo, id: string, needed: boolean): string?
+	local j = state.jira
+	if j.missing_task == t.id and j.missing[id] then
+		return "missing"
+	end
+	return if needed then "required" else nil
+end
+
+-- The text input of a Jira text-like field: the draft while it is being typed in (its key
+-- gets "-r<rev>", as field_node does with "_<rev>"), else the task's value.
+function jira.input(state: State, t: Todo, f: JiraField): Node
+	local inline = jira.inline(f)
+	local v = if t.jira_fields then t.jira_fields[f.id] else nil
+	local idle = if type(v) == "string" then v else ""
+	local props: { [string]: any } = {
+		key = "jx-" .. f.id,
+		role = ROLE .. (if inline then "jc-input" else "jc-area"),
+		aria = f.name,
+		placeholder = if f.kind == "number" then "0"
+			elseif f.kind == "date" then "YYYY-MM-DD"
+			elseif f.kind == "datetime" then "YYYY-MM-DD HH:MM"
+			elseif f.kind == "labels" then "Labels, separated by spaces"
+			else "Add " .. string.lower(f.name),
+	}
+	local fx = state.jx
+	if state.focus == "jx" and state.jira.jx_field == f.id and fx.task == t.id then
+		fx.id = jira.jx_path(f) .. "-r" .. fx.rev
+		props.key ..= "-r" .. fx.rev
+		props.text = fx.text
+		props.cursor = utf16_offset(fx.text, fx.cur)
+		if fx.anchor and fx.anchor ~= fx.cur then
+			props.anchor = utf16_offset(fx.text, fx.anchor)
+		end
+	else
+		props.text = idle
+		props.cursor = utf16_offset(idle, math.huge)
+	end
+	return ui.node(if inline then "input" else "editor", props)
+end
+
+-- The control of a Jira field in its row: a pill that opens its choices (choice, user), a
+-- text input, or a note for a field only Jira can set.
+function jira.control(state: State, t: Todo, f: JiraField): Node
+	if f.kind == "choice" or f.kind == "user" then
+		local v = if t.jira_fields then t.jira_fields[f.id] else nil
+		local open = state.pick ~= nil and state.pick.kind == "jira_field" and state.jira.pick_field == f.id
+		return el("button", "pillbtn", "pick", {
+			text = jira.value_label(f, v),
+			tone = if v == nil then "muted" else nil,
+			attrs = { ["data-icon"] = "none", ["data-open"] = if open then "true" else "false" },
+			actions = { click = "jpick=" .. f.id },
+		})
+	elseif f.kind == "other" then
+		return el("span", "jc-na", "na", { text = "Set in Jira" })
+	end
+	return jira.input(state, t, f)
+end
+
+-- The Jira part of the task card. A linked task shows its issue. An open task, while Jira is
+-- connected, gets the draft of its issue: project, type, component, then the create screen's
+-- fields (one-line ones in rows, long texts under their names; "more fields" opens the rest)
+-- and Post to Jira. Nil when there is no Jira part.
+function jira.section(state: State, t: Todo): Node?
 	local j = state.jira
 	local link = t.jira
 	if link then
-		return {
+		return el("div", "dsec", "jira", nil, {
+			el("div", "dsec-title", "title", { text = "Jira" }),
 			card.row("issue", "Issue", {
 				el("button", "pillbtn", "issue", {
 					text = link.key,
@@ -4974,18 +5749,75 @@ function jira.card_rows(state: State, t: Todo): { Node }?
 					actions = { click = "jissue" },
 				}),
 			}),
-		}
+		})
 	end
 	if j.conn ~= "connected" or t.done then
 		return nil
 	end
 	local p, comp, ready = jira.target(state)
+	local fields, _, kind = jira.form_fields(state)
 	local project = if p then p.name elseif j.busy.projects then "Loading…" else "Pick a project"
 	local component = if comp then comp.name elseif p and not ready then "Loading…" else "No component"
-	return {
+	local kind_label = if kind then kind.name elseif p and j.meta_error[p.key] then "Jira's default" else "Loading…"
+	local rows: { Node } = {
 		card.row("jproject", "Project", { pill_box(state, "jira_target", "jtarget", project, if p then nil else "muted", nil) }),
+		card.row("jtype", "Type", { pill_box(state, "jira_type", "jtype", kind_label, if kind then nil else "muted", nil) }),
 		card.row("jcomp", "Component", { pill_box(state, "jira_component", "jcomp", component, if comp then nil else "muted", nil) }),
 	}
+	local texts: { Node } = {}
+	local hidden = 0
+	local shown: { JiraField } = fields or {}
+	for _, f in shown do
+		if not j.more and not jira.main_field(state, t, f) then
+			hidden += 1
+		elseif jira.inline(f) then
+			table.insert(rows, card.row("jf-" .. f.id, f.name, { jira.control(state, t, f) }, jira.mark(state, t, f.id, jira.needed(f))))
+		else
+			local mark = jira.mark(state, t, f.id, jira.needed(f))
+			table.insert(texts, el("div", "jc-block", "jf-" .. f.id, nil, {
+				el("span", "plabel", "label", { text = f.name, attrs = { ["data-state"] = mark or "none" } }),
+				jira.input(state, t, f),
+			}))
+		end
+	end
+	local kids: { Node } = {
+		el("div", "jc-head", "head", nil, {
+			el("span", "jc-mark", "mark", { text = "Jira" }),
+			el("span", "jc-sub", "sub", { text = "New issue" }),
+		}),
+		el("div", "jc-rows", "rows", nil, rows),
+	}
+	if #texts > 0 then
+		table.insert(kids, el("div", "jc-texts", "texts", nil, texts))
+	end
+	if p and j.meta_error[p.key] then
+		table.insert(kids, el("div", "jc-note", "error", { attrs = { ["data-tone"] = "error" } }, {
+			el("span", "jc-note-text", "text", { text = "Jira's fields did not load: " .. j.meta_error[p.key] }),
+			el("button", "jc-more", "retry", { text = "Retry", actions = { click = "jretry" } }),
+		}))
+	elseif p and not fields then
+		table.insert(kids, el("div", "jc-note", "load", { text = "Loading Jira's fields…" }))
+	end
+	if j.missing_task == t.id and j.missing.description then
+		table.insert(kids, el("div", "jc-note", "desc", { text = "Jira needs a description: write it in the notes above.", attrs = { ["data-tone"] = "warning" } }))
+	end
+	local post = jira.post_label(state, t) or "Post to Jira"
+	local foot: { Node } = {}
+	if hidden > 0 or j.more then
+		table.insert(foot, el("button", "jc-more", "more", {
+			text = if j.more then "Fewer fields" else hidden .. (if hidden == 1 then " more field" else " more fields"),
+			attrs = { ["data-open"] = if j.more then "true" else "false" },
+			actions = { click = "jmore" },
+		}))
+	end
+	table.insert(foot, el("button", "pill", "jpost", {
+		text = post,
+		title = "Title becomes the summary, notes the description",
+		attrs = { ["data-busy"] = if post == "Posting…" then "true" else "false", ["data-kind"] = "jira" },
+		actions = { click = "jpost" },
+	}))
+	table.insert(kids, el("div", "jc-foot", "foot", nil, foot))
+	return el("div", "jcomp", "jira", nil, kids)
 end
 
 -- The text of the card's Post to Jira button; nil when the task cannot be posted.
@@ -5008,7 +5840,7 @@ function card.view(state: State, t: Todo): Node
 	local notes = field_node("editor", {
 		key = "notes",
 		role = ROLE .. "notes",
-		placeholder = "Add notes",
+		placeholder = if jira.post_label(state, t) then "Add notes. They become the Jira description." else "Add notes",
 	}, if state.focus == "notes" then state.notes else nil, t.notes)
 	local head_kids: { Node } = {}
 	if draft then
@@ -5070,20 +5902,11 @@ function card.view(state: State, t: Todo): Node
 		}),
 		card.row("chat", "Chat", { pill_box(state, "chat", "chat", chat_title(state, t), nil, nil) }),
 	}))
-	local jira_rows = jira.card_rows(state, t)
-	if jira_rows then
-		table.insert(jira_rows, 1, el("div", "dsec-title", "title", { text = "Jira" }))
-		table.insert(kids, el("div", "dsec", "jira", nil, jira_rows))
+	local section = jira.section(state, t)
+	if section then
+		table.insert(kids, section)
 	end
 	local actions: { Node } = {}
-	local post = jira.post_label(state, t)
-	if post then
-		table.insert(actions, el("button", "pill", "jpost", {
-			text = post,
-			attrs = { ["data-busy"] = if post == "Posting…" then "true" else "false" },
-			actions = { click = "jpost" },
-		}))
-	end
 	if draft then
 		table.insert(actions, el("button", "pill", "add", {
 			text = "Add task",
@@ -5124,7 +5947,8 @@ function jira.row(state: State, tk: Ticket, live: { [number]: boolean }): Node
 		el("span", "badge", "key", { text = tk.key, attrs = { ["data-kind"] = "jira" } }),
 		el("span", "badge", "status", { text = tk.status, tone = jira.TONE[tk.category] or "muted" }),
 	}
-	if tk.assignee then
+	-- Grouped by assignee, the group's header already names them.
+	if tk.assignee and state.jira.view.group ~= "assignee" then
 		table.insert(meta, el("span", "jmeta", "who", { text = tk.assignee }))
 	end
 	if t then
@@ -5176,7 +6000,9 @@ function jira.left(state: State): Node
 			for _, s in sprints do
 				table.insert(names, s.name)
 			end
-			subtitle = table.concat(names, ", ") .. " · " .. plural(#tickets, "ticket")
+			local mine = jira.count(state)
+			subtitle = table.concat(names, ", ") .. " · "
+				.. (if j.view.mine then "yours: " .. mine .. " of " .. plural(#tickets, "ticket") else plural(#tickets, "ticket"))
 			local ends = if #sprints == 1 then jira.short_date(sprints[1].ends) else nil
 			if ends then
 				subtitle ..= " · ends " .. ends
@@ -5188,7 +6014,7 @@ function jira.left(state: State): Node
 	end
 	local kids: { Node } = {
 		el("div", "head", "head", nil, {
-			el("div", "heading", "heading", { text = "Tickets" }),
+			el("div", "heading", "heading", { text = "Jira tickets" }),
 			el("div", "subtitle", "subtitle", { text = subtitle }),
 			jira.tabs(state),
 		}),
@@ -5213,6 +6039,23 @@ function jira.left(state: State): Node
 			actions = { click = "jedit" },
 		}))
 		table.insert(kids, el("div", "jbar", "jbar", nil, bar))
+		if tickets and #tickets > 0 then
+			-- The view: everyone's tickets or only yours, and how they are grouped.
+			local function seg(mine: boolean, text: string): Node
+				return el("button", "tabbtn", if mine then "mine" else "all", {
+					text = text,
+					title = (if mine then "Only the tickets assigned to you" else "Every ticket of the sprint") .. " (m switches)",
+					attrs = { ["data-active"] = if j.view.mine == mine then "true" else "false" },
+					actions = { click = "jmine=" .. (if mine then "on" else "off") },
+				})
+			end
+			table.insert(kids, el("div", "jfilter", "jfilter", nil, {
+				el("div", "jseg", "jseg", nil, { seg(false, "Everyone"), seg(true, "Only mine") }),
+				pill_box(state, "jira_group", "jgroup",
+					if j.view.group == "none" then "No grouping" else "Group by " .. string.lower(jira.GROUP_LABEL[j.view.group]),
+					nil, nil),
+			}))
+		end
 	end
 	local rows: { Node } = {}
 	if j.error then
@@ -5222,8 +6065,28 @@ function jira.left(state: State): Node
 		table.insert(rows, el("div", "jnote", "note", { text = note }))
 	end
 	local live = live_panes()
-	for _, tk in tickets or {} do
-		table.insert(rows, jira.row(state, tk, live))
+	local groups = jira.groups(state)
+	if tickets and #tickets > 0 and #groups == 0 then
+		table.insert(rows, el("div", "jempty", "mine-none", nil, {
+			el("div", "jnote", "note", { text = "Nothing in this sprint is assigned to you." }),
+			el("button", "pill", "showall", { text = "Show everyone's tickets", actions = { click = "jmine=off" } }),
+		}))
+	end
+	for i, g in groups do
+		local folded = j.folded[g.id] == true
+		if g.id ~= "all" then
+			table.insert(rows, el("button", "arch-head", "g" .. i, {
+				text = g.label .. " (" .. #g.tickets .. ")",
+				title = if folded then "Show these tickets" else "Hide these tickets",
+				attrs = { ["data-open"] = if folded then "false" else "true" },
+				actions = { click = "jfold=" .. g.id },
+			}))
+		end
+		if not folded then
+			for _, tk in g.tickets do
+				table.insert(rows, jira.row(state, tk, live))
+			end
+		end
 	end
 	table.insert(kids, el("div", "rows", "rows", { attrs = { ["data-lift"] = "off" } }, rows))
 	return el("div", "left", "left", nil, kids)
@@ -5259,10 +6122,14 @@ function jira.card(state: State, tk: Ticket): Node
 			el("span", "statuschip", "chip", { text = line, attrs = { ["data-kind"] = kind } }),
 		}))
 	end
-	table.insert(kids, el("div", "jdesc", "desc", {
+	table.insert(kids, el("div", if tk.description then "jdesc" else "jdesc-none", "desc", {
 		text = tk.description or "No description.",
-		attrs = { ["data-empty"] = if tk.description then "false" else "true" },
 	}))
+	-- Its long text fields (Definition of Done, Acceptance criteria…), each under its name.
+	for i, d in tk.details do
+		table.insert(kids, el("div", "jsec", "dt" .. i, { text = d.name }))
+		table.insert(kids, el("div", "jdesc", "dd" .. i, { text = d.text }))
+	end
 	local buttons: { Node } = {
 		el("button", "pill", "jira", { text = "Open in Jira", actions = { click = "tjira=" .. tk.key } }),
 		el("button", "pill", "task", {
@@ -5370,6 +6237,14 @@ function jira.key(state: State, key: Key): boolean
 		if tk then
 			jira.open_issue(state, tk.key)
 		end
+	elseif k == "m" then
+		if connected then
+			jira.set_view(state, not j.view.mine, nil)
+		end
+	elseif k == "s" then
+		if connected then
+			open_picker(state, "jira_group")
+		end
 	elseif k == "r" then
 		jira.load(state, true)
 	elseif k == "p" then
@@ -5401,6 +6276,13 @@ end
 function jira.event(state: State, act: any, value: any): boolean
 	local j = state.jira
 	local tk = if type(value) == "string" then jira.ticket(state, value) else nil
+	if act == "jmine" then
+		jira.set_view(state, value == "on", nil)
+		return true
+	elseif act == "jfold" and type(value) == "string" then
+		j.folded[value] = not j.folded[value]
+		return true
+	end
 	if act == "tsel" or act == "topen" then
 		if not tk then
 			return true
@@ -5457,6 +6339,22 @@ function jira.event(state: State, act: any, value: any): boolean
 		end
 		if t then
 			jira.post(state, t)
+		end
+	elseif act == "jpick" and type(value) == "string" then
+		-- A Jira field's pill on the task card: its choices, or closes them.
+		if state.pick and state.pick.kind == "jira_field" and j.pick_field == value then
+			close_picker(state)
+		else
+			j.pick_field = value
+			open_picker(state, "jira_field")
+		end
+	elseif act == "jmore" then
+		j.more = not j.more
+	elseif act == "jretry" then
+		local p = jira.target(state)
+		if p then
+			j.meta_error[p.key] = nil
+			jira.prefetch(state)
 		end
 	elseif act == "jissue" then
 		local t = selected(state)
@@ -5697,6 +6595,7 @@ tern.block.define("list", {
 			jurl = new_field("", false, nil),
 			jemail = new_field("", false, nil),
 			jtoken = new_field("", false, nil),
+			jx = new_field("", true, nil),
 		}
 		running[cx.pane] = state
 		if not saved and state.path and string.sub(state.path, 1, 1) == "/" then
@@ -5772,6 +6671,8 @@ tern.block.define("list", {
 					then "↑↓ PgUp PgDn choose  ·  Tab complete path  ·  ⏎ pick  ·  Esc close"
 					elseif jira.field(state, state.focus)
 					then "Enter connect  ·  Tab next field  ·  Esc leave field"
+					elseif state.focus == "jx"
+					then (if state.jx.multiline then "Enter new line  ·  Tab save  ·  Esc cancel" else "Enter save  ·  Esc cancel")
 					elseif state.focus == "title"
 					then "Enter save  ·  Esc cancel"
 					elseif state.focus == "notes"
@@ -5781,10 +6682,10 @@ tern.block.define("list", {
 					else if state.lift
 						then "Click a task to move it there  ·  click the grip or Esc to cancel"
 						elseif state.tab == "tickets"
-						then "j/k move  ·  ⏎ start  ·  a add to tasks  ·  o open in Jira  ·  r reload  ·  p project  ·  b board  ·  c connection  ·  T tasks  ·  , settings"
+						then "j/k move  ·  ⏎ start  ·  a add to tasks  ·  o open in Jira  ·  m only mine  ·  s group  ·  r reload  ·  p project  ·  b board  ·  c connection  ·  T tasks  ·  , settings"
 						elseif next(state.sel) ~= nil
 						then "⇧↑↓ extend  ·  v mark  ·  ⌘A all  ·  space done  ·  b backlog  ·  z archive  ·  ⌫⌫ delete  ·  Esc clear  ·  , settings"
-						else "j/k move  ·  space done  ·  ⏎ open  ·  Tab add  ·  e notes  ·  F2 rename  ·  p project  ·  b backlog  ·  B tab  ·  T tickets  ·  z archive  ·  ⌫ delete  ·  v select  ·  , settings",
+						else "j/k move  ·  space done  ·  ⏎ open  ·  Tab add  ·  e notes  ·  F2 rename  ·  p project  ·  b backlog  ·  B tab  ·  T Jira tickets  ·  z archive  ·  ⌫ delete  ·  v select  ·  , settings",
 		})
 		local dockkids: { Node } = {}
 		if state.cfg.hints then
@@ -5971,6 +6872,12 @@ tern.block.define("list", {
 			return
 		end
 		if ev.ev == "focus" and type(ev.id) == "string" then
+			-- A Jira field of the task card: "…jx-<field id>", "-r<rev>" while typed in.
+			local jx = string.match(ev.id, "%.jx%-([^.]-)%-r%d+$") or string.match(ev.id, "%.jx%-([^.]+)$")
+			if jx then
+				jira.focus_field(state, jx)
+				return
+			end
 			local tail = string.match(ev.id, "%.(%a+)_?%d*$")
 			if tail == "field" then
 				set_focus(state, "add")
@@ -6008,9 +6915,10 @@ tern.block.define("list", {
 			return
 		end
 		local act, value = ev.act, ev.value
-		if state.focus == "title" or state.focus == "notes" then
-			-- A new task's notes hand back to its add row, so the card's buttons still see it.
-			set_focus(state, if state.fresh and state.focus == "notes" then "add" else nil)
+		if state.focus == "title" or state.focus == "notes" or state.focus == "jx" then
+			-- A new task's notes and Jira fields hand back to its add row, so the card's buttons
+			-- still see it.
+			set_focus(state, if state.fresh and state.focus ~= "title" then "add" else nil)
 		end
 		if jira.event(state, act, value) then
 			return
